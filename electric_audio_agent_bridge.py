@@ -3333,6 +3333,8 @@ def explain_charge_push_up_trace(
 
 TEMPO_BPM_MIN = 70.0
 TEMPO_BPM_MAX = 185.0
+TEMPO_PRIOR_CENTER_BPM = 120.0
+TEMPO_PRIOR_SIGMA_OCTAVES = 1.0
 
 
 def _estimate_tempo_onset_autocorr(
@@ -3345,8 +3347,10 @@ def _estimate_tempo_onset_autocorr(
 
     Onset strength = positive flux of log energy in two lanes (broadband for
     kick/bass, first-difference for hat/snare transients), minus a ~0.5 s moving
-    mean. The autocorrelation peak inside [TEMPO_BPM_MIN, TEMPO_BPM_MAX] is
-    refined to a sub-frame lag by parabolic interpolation.
+    mean. Each candidate lag in [TEMPO_BPM_MIN, TEMPO_BPM_MAX] is scored by its
+    autocorrelation plus half/double-period support, weighted by a log-normal
+    tempo prior; the winner is refined to a sub-frame lag by parabolic
+    interpolation.
 
     Returns (bpm, confidence in 0..1); (0.0, 0.0) when the clip is under ~1 s
     or carries no onset energy.
@@ -3379,10 +3383,19 @@ def _estimate_tempo_onset_autocorr(
         lo, hi = max(0, i - half_win), min(n, i + half_win)
         onset.append(max(0.0, flux[i] - (prefix[hi] - prefix[lo]) / (hi - lo)))
 
+    ac_cache: Dict[int, float] = {}
+
     def autocorr(lag: int) -> float:
         if lag >= n:
             return 0.0
-        return sum(a * b for a, b in zip(onset, onset[lag:])) / (n - lag)
+        if lag not in ac_cache:
+            ac_cache[lag] = sum(a * b for a, b in zip(onset, onset[lag:])) / (n - lag)
+        return ac_cache[lag]
+
+    def autocorr_at(x: float) -> float:
+        i = int(x)
+        f = x - i
+        return autocorr(i) * (1.0 - f) + autocorr(i + 1) * f
 
     r0 = autocorr(0)
     if r0 <= 0.0:
@@ -3390,7 +3403,16 @@ def _estimate_tempo_onset_autocorr(
     fps = sample_rate_hz / float(hop)
     lag_lo = int(math.floor(fps * 60.0 / TEMPO_BPM_MAX))
     lag_hi = int(math.ceil(fps * 60.0 / TEMPO_BPM_MIN))
-    scores = {lag: autocorr(lag) for lag in range(lag_lo - 1, lag_hi + 2)}
+
+    def score(lag: int) -> float:
+        # Metrical support: a true beat period is reinforced at its half (8th
+        # notes) and double (half-bar); 3:4 swing artefacts are not. A log-normal
+        # prior around TEMPO_PRIOR_CENTER_BPM breaks 2:3 ties between candidates.
+        metrical = autocorr(lag) + 0.5 * autocorr_at(lag / 2.0) + 0.25 * autocorr(2 * lag)
+        octaves = math.log2((60.0 * fps / lag) / TEMPO_PRIOR_CENTER_BPM)
+        return metrical * math.exp(-0.5 * (octaves / TEMPO_PRIOR_SIGMA_OCTAVES) ** 2)
+
+    scores = {lag: score(lag) for lag in range(lag_lo - 1, lag_hi + 2)}
     best_lag = max(range(lag_lo, lag_hi + 1), key=lambda lag: scores[lag])
 
     a, b, c = scores[best_lag - 1], scores[best_lag], scores[best_lag + 1]
@@ -3398,7 +3420,7 @@ def _estimate_tempo_onset_autocorr(
     frac = 0.5 * (a - c) / curvature if curvature < 0.0 else 0.0
     bpm = 60.0 * fps / (best_lag + max(-0.5, min(0.5, frac)))
     bpm = max(TEMPO_BPM_MIN, min(TEMPO_BPM_MAX, bpm))
-    return bpm, max(0.0, min(1.0, b / r0))
+    return bpm, max(0.0, min(1.0, autocorr(best_lag) / r0))
 
 
 def validate_and_translate_consented_pcm_samples(
