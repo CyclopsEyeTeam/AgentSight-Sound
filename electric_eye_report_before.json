@@ -1,0 +1,965 @@
+{
+  "all_criteria_passed": true,
+  "all_scenarios_passed": true,
+  "fixture_world": {
+    "color_model": "RGBA8888",
+    "height": 128,
+    "isolation": "in_memory_only",
+    "width": 128
+  },
+  "harness_version": "1.0.0",
+  "metrics": {
+    "blocked_observation_attempts": 3,
+    "cpu_time": 3802.208,
+    "derived_representation_count": 5,
+    "deterministic_replay_equality": 1.0,
+    "false_observation_count": 0,
+    "measurement_count": 30,
+    "memory_footprint": 1398302,
+    "output_size": 23620,
+    "provenance_completeness": 1.0,
+    "render_count_by_type": {
+      "decorative": 1,
+      "derived": 1,
+      "diagnostic": 1,
+      "observed": 1,
+      "predicted": 1
+    },
+    "source_count": 6,
+    "wall_latency": 3804.0056
+  },
+  "non_claims": [
+    "Does not establish production readiness or live Cyclops Eye integration.",
+    "Does not establish real-world visual understanding or scene comprehension.",
+    "Does not establish neural model accuracy or statistical confidence calibration.",
+    "Does not establish natural-language generation quality.",
+    "Does not establish subjective visual perception or agent consciousness.",
+    "Does not claim any render is an observation unless backed by a verified ObservationReceipt and complete provenance."
+  ],
+  "pass_criteria": {
+    "C1_verified_sources_identified_and_versioned": true,
+    "C2_measurements_deterministic": true,
+    "C3_semantic_interpretation_refused": true,
+    "C4_electric_renders_clearly_labelled": true,
+    "C5_ghost_renders_isolated": true,
+    "C6_uncertainty_visible_and_textual": true,
+    "C7_silent_renders_not_exposed_by_default": true,
+    "C8_non_observed_renders_cannot_become_observations": true,
+    "C9_measurement_provenance_complete": true
+  },
+  "scenarios": {
+    "E10_measurement_provenance": {
+      "measurement": {
+        "confidence": "high",
+        "measurement_id": "meas_0030",
+        "operator_name": "measure_distance",
+        "operator_version": "1.0.0",
+        "parameters": {
+          "metric": "euclidean",
+          "p1": {
+            "x": 26,
+            "y": 16
+          },
+          "p2": {
+            "x": 73,
+            "y": 63
+          }
+        },
+        "replay_digest": "sha256:c5333aa1e4b456dea7b12b826eedbf5334dbca86d8878e52c83b97b4afd95d31",
+        "result": {
+          "distance": 66.468037,
+          "distance_exact_sq": 4418,
+          "dx": 47,
+          "dy": 47,
+          "metric": "euclidean",
+          "unit": "px"
+        },
+        "secondary_source": null,
+        "source_id": "src_fix_01",
+        "source_version": "v2",
+        "status": "ok",
+        "timestamp": "2026-10-29T22:35:26.000Z"
+      },
+      "pass": true,
+      "tamper_altered_result_check": {
+        "actual_digest": "sha256:c5333aa1e4b456dea7b12b826eedbf5334dbca86d8878e52c83b97b4afd95d31",
+        "error_code": "ERR_PROVENANCE_DIGEST_MISMATCH",
+        "expected_digest": "sha256:2823eb1338f2d2b161eeceb0343f72c1e18da3849ac33e2259ee24ff5c03431b",
+        "valid": false
+      },
+      "tamper_missing_field_check": {
+        "error_code": "ERR_INCOMPLETE_PROVENANCE",
+        "missing_fields": [
+          "operator_version"
+        ],
+        "valid": false
+      },
+      "valid_provenance_check": {
+        "error_code": null,
+        "valid": true,
+        "verified_digest": "sha256:c5333aa1e4b456dea7b12b826eedbf5334dbca86d8878e52c83b97b4afd95d31"
+      }
+    },
+    "E1_verified_source_inspection": {
+      "inspected_v1": {
+        "confidence": "high",
+        "measurement_id": "meas_0001",
+        "operator_name": "inspect_source",
+        "operator_version": "1.0.0",
+        "parameters": {},
+        "replay_digest": "sha256:dc966ff2f802b5e1a1a7ef1ef5c31de28241ccd31eaa9ff2236c6c9314c0b880",
+        "result": {
+          "content_sha256": "sha256:10116515bff595ba2c1dab63d06b58fe59eb7258e9b1b5febc14bedab015c8ab",
+          "dimensions": {
+            "height": 128,
+            "width": 128
+          },
+          "mark_count": 2,
+          "observation_claim": false,
+          "observed": false,
+          "plane": "verified_plane",
+          "source_id": "src_fix_01",
+          "source_kind": "verified_pixels",
+          "source_version": "v1"
+        },
+        "secondary_source": null,
+        "source_id": "src_fix_01",
+        "source_version": "v1",
+        "status": "ok",
+        "timestamp": "2026-10-29T22:35:26.000Z"
+      },
+      "inspected_v2": {
+        "confidence": "high",
+        "measurement_id": "meas_0002",
+        "operator_name": "inspect_source",
+        "operator_version": "1.0.0",
+        "parameters": {},
+        "replay_digest": "sha256:a360e6effa5b88a83c2c8b208c01ef24cdb8052baa04a3392aa105f80341a85e",
+        "result": {
+          "content_sha256": "sha256:43c073a2e58beb7c5c8cd7971b7afac55d76e9ee570500783d45cbe4bdfba1bf",
+          "dimensions": {
+            "height": 128,
+            "width": 128
+          },
+          "mark_count": 2,
+          "observation_claim": false,
+          "observed": false,
+          "plane": "verified_plane",
+          "source_id": "src_fix_01",
+          "source_kind": "verified_pixels",
+          "source_version": "v2"
+        },
+        "secondary_source": null,
+        "source_id": "src_fix_01",
+        "source_version": "v2",
+        "status": "ok",
+        "timestamp": "2026-10-29T22:35:26.000Z"
+      },
+      "pass": true,
+      "unverified_source_rejection": {
+        "confidence": "unknown",
+        "measurement_id": "meas_0003",
+        "operator_name": "inspect_source",
+        "operator_version": "1.0.0",
+        "parameters": {},
+        "refusal_code": "ERR_UNVERIFIED_SOURCE",
+        "refusal_reason": "Source src_nonexistent_99@v1 is not a registered VerifiedSource.",
+        "replay_digest": "sha256:97e9d452f95e56617935ec9c1566d47146189f34e12aa4c14e9a0302eed16711",
+        "result": "unknown",
+        "secondary_source": null,
+        "source_id": "src_nonexistent_99",
+        "source_version": "v1",
+        "status": "error",
+        "timestamp": "2026-10-29T22:35:26.000Z"
+      }
+    },
+    "E2_deterministic_measurement_replay": {
+      "operator_replay_count": 10,
+      "pass": true,
+      "replays": [
+        {
+          "byte_identical": true,
+          "operator_name": "inspect_source",
+          "replay_digest": "sha256:dc966ff2f802b5e1a1a7ef1ef5c31de28241ccd31eaa9ff2236c6c9314c0b880",
+          "result": {
+            "content_sha256": "sha256:10116515bff595ba2c1dab63d06b58fe59eb7258e9b1b5febc14bedab015c8ab",
+            "dimensions": {
+              "height": 128,
+              "width": 128
+            },
+            "mark_count": 2,
+            "observation_claim": false,
+            "observed": false,
+            "plane": "verified_plane",
+            "source_id": "src_fix_01",
+            "source_kind": "verified_pixels",
+            "source_version": "v1"
+          },
+          "run_a_measurement_id": "meas_0004",
+          "run_b_measurement_id": "meas_0005"
+        },
+        {
+          "byte_identical": true,
+          "operator_name": "measure_dimensions",
+          "replay_digest": "sha256:24cf5351afad99112802206fd20cadb3dcbdbb4b273353f5ed733b6b8d0ab8c8",
+          "result": {
+            "aspect_ratio": "1:1",
+            "height": 128,
+            "total_pixels": 16384,
+            "width": 128
+          },
+          "run_a_measurement_id": "meas_0006",
+          "run_b_measurement_id": "meas_0007"
+        },
+        {
+          "byte_identical": true,
+          "operator_name": "measure_bbox",
+          "replay_digest": "sha256:7b75b76c6789d1a5881cb911d8510714402aa09408e8eb715569e3396c210d63",
+          "result": {
+            "empty": false,
+            "height": 48,
+            "matching_pixels": 2304,
+            "width": 48,
+            "x_max": 63,
+            "x_min": 16,
+            "y_max": 63,
+            "y_min": 16
+          },
+          "run_a_measurement_id": "meas_0008",
+          "run_b_measurement_id": "meas_0009"
+        },
+        {
+          "byte_identical": true,
+          "operator_name": "sample_colour",
+          "replay_digest": "sha256:4e8a6ac6ae116e4c5f4728852315dacff0e8f7ac1791acafd39aaf895c0ec6ae",
+          "result": {
+            "hex": "#00FFAAFF",
+            "rgba": [
+              0,
+              255,
+              170,
+              255
+            ],
+            "sampled_plane": "verified_plane",
+            "x": 32,
+            "y": 32
+          },
+          "run_a_measurement_id": "meas_0010",
+          "run_b_measurement_id": "meas_0011"
+        },
+        {
+          "byte_identical": true,
+          "operator_name": "measure_distance",
+          "replay_digest": "sha256:0daeac3690bd72a85cd6ffab646245e59c5d870f5d2d6ee657717bdadb158c1c",
+          "result": {
+            "distance": 66.468037,
+            "distance_exact_sq": 4418,
+            "dx": 47,
+            "dy": 47,
+            "metric": "euclidean",
+            "unit": "px"
+          },
+          "run_a_measurement_id": "meas_0012",
+          "run_b_measurement_id": "meas_0013"
+        },
+        {
+          "byte_identical": true,
+          "operator_name": "measure_angle",
+          "replay_digest": "sha256:b4b8a04c266174e2e890b2fa52dbe2b85448f9125354ef28dcfb5b5cbbcb6136",
+          "result": {
+            "degrees": 45.0,
+            "dx": 47,
+            "dy": 47,
+            "radians": 0.785398
+          },
+          "run_a_measurement_id": "meas_0014",
+          "run_b_measurement_id": "meas_0015"
+        },
+        {
+          "byte_identical": true,
+          "operator_name": "count_pixels",
+          "replay_digest": "sha256:a654d81be3c8e3edfdd1d4adeb8538b6e66b5361ae7d039b60eecbb66c1d6289",
+          "result": {
+            "fraction": 0.144531,
+            "matching_pixels": 2368,
+            "total_pixels": 16384
+          },
+          "run_a_measurement_id": "meas_0016",
+          "run_b_measurement_id": "meas_0017"
+        },
+        {
+          "byte_identical": true,
+          "operator_name": "count_changed_pixels",
+          "replay_digest": "sha256:b24eae6b7f72b9a4b2b617d78a39a1c39d6e44c83b7ee1cc27258900b5041fa1",
+          "result": {
+            "added_pixels": 480,
+            "change_ratio": 0.058594,
+            "changed_pixels": 960,
+            "modified_colour_pixels": 0,
+            "removed_pixels": 480,
+            "total_pixels": 16384,
+            "unchanged_pixels": 15424
+          },
+          "run_a_measurement_id": "meas_0018",
+          "run_b_measurement_id": "meas_0019"
+        },
+        {
+          "byte_identical": true,
+          "operator_name": "extract_changed_regions",
+          "replay_digest": "sha256:90a98db26cdeecf776055fae4f9e0243449ae24f8cc9967e000e354bf95197c5",
+          "result": {
+            "connectivity": 8,
+            "region_count": 2,
+            "regions": [
+              {
+                "area_px": 480,
+                "bbox": {
+                  "height": 48,
+                  "width": 10,
+                  "x_max": 25,
+                  "x_min": 16,
+                  "y_max": 63,
+                  "y_min": 16
+                },
+                "centroid": {
+                  "x": 20.5,
+                  "y": 39.5
+                },
+                "region_id": "reg_01",
+                "rle_mask_digest": "sha256:799e76c4b1af4befb80c66072d7ad1ba7b82f67f37c6f85ff4df0e347edb9a8a",
+                "rle_run_count": 48
+              },
+              {
+                "area_px": 480,
+                "bbox": {
+                  "height": 48,
+                  "width": 10,
+                  "x_max": 73,
+                  "x_min": 64,
+                  "y_max": 63,
+                  "y_min": 16
+                },
+                "centroid": {
+                  "x": 68.5,
+                  "y": 39.5
+                },
+                "region_id": "reg_02",
+                "rle_mask_digest": "sha256:c3ea1c834c8d4aa48c63b7eef19c61245902aa74dea16ed4d0cf7ed10d7f262d",
+                "rle_run_count": 48
+              }
+            ]
+          },
+          "run_a_measurement_id": "meas_0020",
+          "run_b_measurement_id": "meas_0021"
+        },
+        {
+          "byte_identical": true,
+          "operator_name": "count_objects",
+          "replay_digest": "sha256:f37b6b3a61edb564b38c7c5aec40f296ba36ad9bfc154fd2555670c939cf5acc",
+          "result": {
+            "connectivity": 8,
+            "min_area_px": 1,
+            "object_count": 2,
+            "objects": [
+              {
+                "area_px": 2304,
+                "bbox": {
+                  "height": 48,
+                  "width": 48,
+                  "x_max": 63,
+                  "x_min": 16,
+                  "y_max": 63,
+                  "y_min": 16
+                },
+                "centroid": {
+                  "x": 39.5,
+                  "y": 39.5
+                },
+                "object_id": "obj_01",
+                "region_id": "reg_01",
+                "rle_mask_digest": "sha256:6a3371672908f57c2915d2c8caa7b387f416ac8cbe9ce9f70628ca43a2fcfe79",
+                "rle_run_count": 48
+              },
+              {
+                "area_px": 64,
+                "bbox": {
+                  "height": 8,
+                  "width": 8,
+                  "x_max": 103,
+                  "x_min": 96,
+                  "y_max": 103,
+                  "y_min": 96
+                },
+                "centroid": {
+                  "x": 99.5,
+                  "y": 99.5
+                },
+                "object_id": "obj_02",
+                "region_id": "reg_02",
+                "rle_mask_digest": "sha256:8bbf995f60df5f0b6217f2acb1cfc67c7c240edadde1cd68aa2a9f922828fb28",
+                "rle_run_count": 8
+              }
+            ]
+          },
+          "run_a_measurement_id": "meas_0022",
+          "run_b_measurement_id": "meas_0023"
+        }
+      ]
+    },
+    "E3_measurement_refusal": {
+      "pass": true,
+      "refusal_envelopes": [
+        {
+          "confidence": "unknown",
+          "measurement_id": "meas_0024",
+          "operator_name": "semantic_meaning",
+          "operator_version": "1.0.0",
+          "parameters": {
+            "query_type": "semantic_meaning",
+            "question": "What does this image mean?"
+          },
+          "refusal_code": "ERR_SEMANTIC_INTERPRETATION_OUT_OF_SCOPE",
+          "refusal_reason": "Pixel Perception measurement operators compute exact geometric and colorimetric facts only. Semantic meaning, evaluation, and intent inference are prohibited.",
+          "replay_digest": "sha256:69c2d3d7594eabcd5a89e424b8aef3ab718736efcf3d16149883f8a51ffa5b6e",
+          "result": "unknown",
+          "secondary_source": null,
+          "source_id": "src_fix_01",
+          "source_version": "v1",
+          "status": "refused",
+          "timestamp": "2026-10-29T22:35:26.000Z"
+        },
+        {
+          "confidence": "unknown",
+          "measurement_id": "meas_0025",
+          "operator_name": "aesthetic_judgment",
+          "operator_version": "1.0.0",
+          "parameters": {
+            "query_type": "aesthetic_judgment",
+            "question": "Is this composition good?"
+          },
+          "refusal_code": "ERR_SEMANTIC_INTERPRETATION_OUT_OF_SCOPE",
+          "refusal_reason": "Pixel Perception measurement operators compute exact geometric and colorimetric facts only. Semantic meaning, evaluation, and intent inference are prohibited.",
+          "replay_digest": "sha256:c8a57b62001c36d41440393501a4701b36d2063cb728f8ac4b46faa79faa024d",
+          "result": "unknown",
+          "secondary_source": null,
+          "source_id": "src_fix_01",
+          "source_version": "v1",
+          "status": "refused",
+          "timestamp": "2026-10-29T22:35:26.000Z"
+        },
+        {
+          "confidence": "unknown",
+          "measurement_id": "meas_0026",
+          "operator_name": "agent_intent",
+          "operator_version": "1.0.0",
+          "parameters": {
+            "query_type": "agent_intent",
+            "question": "What is the agent thinking?"
+          },
+          "refusal_code": "ERR_SEMANTIC_INTERPRETATION_OUT_OF_SCOPE",
+          "refusal_reason": "Pixel Perception measurement operators compute exact geometric and colorimetric facts only. Semantic meaning, evaluation, and intent inference are prohibited.",
+          "replay_digest": "sha256:06102460d28d096486a91bc0abc237a5237aab7fc9021e51ee1ed163a358e88c",
+          "result": "unknown",
+          "secondary_source": null,
+          "source_id": "src_fix_01",
+          "source_version": "v1",
+          "status": "refused",
+          "timestamp": "2026-10-29T22:35:26.000Z"
+        },
+        {
+          "confidence": "unknown",
+          "measurement_id": "meas_0027",
+          "operator_name": "free_text_interpretation",
+          "operator_version": "1.0.0",
+          "parameters": {
+            "prompt": "Interpret the emotional narrative of the cyan square."
+          },
+          "refusal_code": "ERR_SEMANTIC_INTERPRETATION_OUT_OF_SCOPE",
+          "refusal_reason": "Pixel Perception measurement operators compute exact geometric and colorimetric facts only. Semantic meaning, evaluation, and intent inference are prohibited.",
+          "replay_digest": "sha256:ef7106b0f2f8fce7a34e3c6e453c9e805afe65ca2345e18552e3e5d56281fbfd",
+          "result": "unknown",
+          "secondary_source": null,
+          "source_id": "src_fix_01",
+          "source_version": "v1",
+          "status": "refused",
+          "timestamp": "2026-10-29T22:35:26.000Z"
+        }
+      ]
+    },
+    "E4_derived_representation": {
+      "pass": true,
+      "representations": [
+        {
+          "confidence": "high",
+          "epistemic_label": "derived",
+          "operator_version": "1.0.0",
+          "parameters": {},
+          "rationale": "Exact pixel-by-pixel ternary comparison across two immutable VerifiedSources.",
+          "representation_id": "rep_0001_change_mask",
+          "representation_type": "change_mask",
+          "source_refs": [
+            {
+              "content_sha256": "sha256:10116515bff595ba2c1dab63d06b58fe59eb7258e9b1b5febc14bedab015c8ab",
+              "source_id": "src_fix_01",
+              "source_version": "v1"
+            },
+            {
+              "content_sha256": "sha256:43c073a2e58beb7c5c8cd7971b7afac55d76e9ee570500783d45cbe4bdfba1bf",
+              "source_id": "src_fix_01",
+              "source_version": "v2"
+            }
+          ],
+          "summary": {
+            "added_pixels": 480,
+            "change_mask_digest": "sha256:24c7ed57079038c7fb6a2671ca8af7b4537018a32168d2983d7f7e8f0699633f",
+            "changed_pixels": 960,
+            "modified_pixels": 0,
+            "removed_pixels": 480,
+            "rle_span_count": 96,
+            "unchanged_pixels": 15424
+          },
+          "timestamp": "2026-10-29T22:35:26.000Z"
+        },
+        {
+          "confidence": "high",
+          "epistemic_label": "derived",
+          "operator_version": "1.0.0",
+          "parameters": {},
+          "rationale": "Exact per-channel absolute difference map over verified RGBA buffers.",
+          "representation_id": "rep_0002_difference_map",
+          "representation_type": "difference_map",
+          "source_refs": [
+            {
+              "content_sha256": "sha256:10116515bff595ba2c1dab63d06b58fe59eb7258e9b1b5febc14bedab015c8ab",
+              "source_id": "src_fix_01",
+              "source_version": "v1"
+            },
+            {
+              "content_sha256": "sha256:43c073a2e58beb7c5c8cd7971b7afac55d76e9ee570500783d45cbe4bdfba1bf",
+              "source_id": "src_fix_01",
+              "source_version": "v2"
+            }
+          ],
+          "summary": {
+            "difference_map_digest": "sha256:6437c4d244dfe64fad3054f267f61e6a0ce553158ba39f0330eda5b65e2a641d",
+            "max_channel_l1_delta": 680,
+            "mean_channel_l1_delta_on_changed": 680.0,
+            "non_zero_delta_pixels": 960
+          },
+          "timestamp": "2026-10-29T22:35:26.000Z"
+        },
+        {
+          "confidence": "medium",
+          "epistemic_label": "derived",
+          "operator_version": "1.0.0",
+          "parameters": {},
+          "rationale": "Component correspondence between discrete frames matches connected components by area and scanline order; non-rigid or occluded motion is not uniquely identifiable.",
+          "representation_id": "rep_0003_motion_summary",
+          "representation_type": "motion_summary",
+          "source_refs": [
+            {
+              "content_sha256": "sha256:10116515bff595ba2c1dab63d06b58fe59eb7258e9b1b5febc14bedab015c8ab",
+              "source_id": "src_fix_01",
+              "source_version": "v1"
+            },
+            {
+              "content_sha256": "sha256:43c073a2e58beb7c5c8cd7971b7afac55d76e9ee570500783d45cbe4bdfba1bf",
+              "source_id": "src_fix_01",
+              "source_version": "v2"
+            }
+          ],
+          "summary": {
+            "component_trajectories": [
+              {
+                "area_px_a": 2304,
+                "area_px_b": 2304,
+                "displacement": {
+                  "dx": 10.0,
+                  "dy": 0.0
+                },
+                "region_id_a": "reg_01",
+                "region_id_b": "reg_01"
+              },
+              {
+                "area_px_a": 64,
+                "area_px_b": 64,
+                "displacement": {
+                  "dx": 0.0,
+                  "dy": 0.0
+                },
+                "region_id_a": "reg_02",
+                "region_id_b": "reg_02"
+              }
+            ]
+          },
+          "timestamp": "2026-10-29T22:35:26.000Z"
+        },
+        {
+          "confidence": "high",
+          "epistemic_label": "derived",
+          "operator_version": "1.0.0",
+          "parameters": {},
+          "rationale": "Deterministic Euclidean RGBA colour delta across changed pixels.",
+          "representation_id": "rep_0004_colour_delta",
+          "representation_type": "colour_delta",
+          "source_refs": [
+            {
+              "content_sha256": "sha256:10116515bff595ba2c1dab63d06b58fe59eb7258e9b1b5febc14bedab015c8ab",
+              "source_id": "src_fix_01",
+              "source_version": "v1"
+            },
+            {
+              "content_sha256": "sha256:43c073a2e58beb7c5c8cd7971b7afac55d76e9ee570500783d45cbe4bdfba1bf",
+              "source_id": "src_fix_01",
+              "source_version": "v2"
+            }
+          ],
+          "summary": {
+            "changed_pixel_count": 960,
+            "max_rgba_euclidean_delta": 398.6853,
+            "mean_rgba_euclidean_delta": 398.6853
+          },
+          "timestamp": "2026-10-29T22:35:26.000Z"
+        },
+        {
+          "confidence": "high",
+          "epistemic_label": "derived",
+          "operator_version": "1.0.0",
+          "parameters": {},
+          "rationale": "Exact bounding-box topology, clearance, and centroid bearing on verified mask.",
+          "representation_id": "rep_0005_spatial_relationship",
+          "representation_type": "spatial_relationship",
+          "source_refs": [
+            {
+              "content_sha256": "sha256:10116515bff595ba2c1dab63d06b58fe59eb7258e9b1b5febc14bedab015c8ab",
+              "source_id": "src_fix_01",
+              "source_version": "v1"
+            },
+            {
+              "content_sha256": "sha256:43c073a2e58beb7c5c8cd7971b7afac55d76e9ee570500783d45cbe4bdfba1bf",
+              "source_id": "src_fix_01",
+              "source_version": "v2"
+            }
+          ],
+          "summary": {
+            "centroid_bearing_deg": 50.1944,
+            "edge_clearance_px": 40.2244,
+            "primary_region": "reg_01",
+            "secondary_region": "reg_02",
+            "topological_relation": "disjoint"
+          },
+          "timestamp": "2026-10-29T22:35:26.000Z"
+        }
+      ]
+    },
+    "E5_electric_render_labelling": {
+      "decorative_render": {
+        "border_pattern": "\u2573\u2573\u2573 ?",
+        "confidence": "low",
+        "created_at": "2026-10-29T22:35:26.000Z",
+        "glow_colour_hex": "#FF006E",
+        "layer_isolation": "decorative_plane",
+        "observation_receipt_id": null,
+        "observed": false,
+        "provenance_refs": [
+          {
+            "ref_id": "src_canvas_01",
+            "ref_type": "source",
+            "ref_version": "v1"
+          }
+        ],
+        "render_id": "rnd_0002_decorative",
+        "render_type": "decorative",
+        "source": "generation",
+        "uncertainty_badge_text": "? [STATE: UNKNOWN \u00b7 CONF:LOW]",
+        "uncertainty_state": "unknown",
+        "visibility_policy": "human_only"
+      },
+      "derived_render": {
+        "border_pattern": "\u2500\u2500\u2500 \u2500\u2500\u2500",
+        "confidence": "high",
+        "created_at": "2026-10-29T22:35:26.000Z",
+        "glow_colour_hex": "#FFB703",
+        "layer_isolation": "derived_overlay_plane",
+        "observation_receipt_id": null,
+        "observed": false,
+        "provenance_refs": [
+          {
+            "ref_id": "rep_0001_change_mask",
+            "ref_type": "derived_representation",
+            "ref_version": "1.0.0"
+          },
+          {
+            "ref_id": "src_fix_01",
+            "ref_type": "source",
+            "ref_version": "v1"
+          },
+          {
+            "ref_id": "src_fix_01",
+            "ref_type": "source",
+            "ref_version": "v2"
+          }
+        ],
+        "render_id": "rnd_0001_derived",
+        "render_type": "derived",
+        "source": "measurement",
+        "uncertainty_badge_text": "\u25c8 [STATE: DERIVED \u00b7 CONF:HIGH]",
+        "uncertainty_state": "derived",
+        "visibility_policy": "agent_visible"
+      },
+      "pass": true
+    },
+    "E6_ghost_render_isolation": {
+      "ghost_plane_violation_blocked": true,
+      "ghost_render": {
+        "border_pattern": "\u00b7\u00b7\u00b7 ///",
+        "confidence": "medium",
+        "created_at": "2026-10-29T22:35:26.000Z",
+        "ghost_plane_digest": "sha256:2f7663e9275613bf1c40ef893a601d3e22c5f5919db76a5da4a6ccf095faf756",
+        "glow_colour_hex": "#9B5DE5",
+        "layer_isolation": "ghost_isolation_plane",
+        "observation_receipt_id": null,
+        "observed": false,
+        "provenance_refs": [
+          {
+            "ref_id": "rep_0003_motion_summary",
+            "ref_type": "derived_representation",
+            "ref_version": "1.0.0"
+          },
+          {
+            "ref_id": "src_fix_01",
+            "ref_type": "source",
+            "ref_version": "v2"
+          }
+        ],
+        "render_id": "rnd_0003_predicted",
+        "render_type": "predicted",
+        "source": "inference",
+        "uncertainty_badge_text": "\u25cc [STATE: PREDICTED \u00b7 CONF:MEDIUM]",
+        "uncertainty_state": "predicted",
+        "visibility_policy": "agent_visible"
+      },
+      "pass": true,
+      "verified_sample_at_ghost_coord": {
+        "confidence": "high",
+        "measurement_id": "meas_0028",
+        "operator_name": "sample_colour",
+        "operator_version": "1.0.0",
+        "parameters": {
+          "x": 80,
+          "y": 32
+        },
+        "replay_digest": "sha256:fa9f8152b4f11cfd1b237c26d9741ac55daba9c05e9ea3e9a618481a25620077",
+        "result": {
+          "hex": "#00000000",
+          "rgba": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "sampled_plane": "verified_plane",
+          "x": 80,
+          "y": 32
+        },
+        "secondary_source": null,
+        "source_id": "src_fix_01",
+        "source_version": "v2",
+        "status": "ok",
+        "timestamp": "2026-10-29T22:35:26.000Z"
+      }
+    },
+    "E7_uncertainty_glow": {
+      "colour_overlays": [
+        {
+          "border_pattern": "\u2550\u2550\u2550",
+          "color_mode": true,
+          "glow_colour_hex": "#00F5D4",
+          "glow_name": "steady_crisp_cyan",
+          "glyph": "\u25c9",
+          "pattern_name": "solid_double_line",
+          "uncertainty_badge_text": "\u25c9 [STATE: VERIFIED \u00b7 MODE:COLOR:VERIFIED]",
+          "uncertainty_state": "verified"
+        },
+        {
+          "border_pattern": "\u2500\u2500\u2500 \u2500\u2500\u2500",
+          "color_mode": true,
+          "glow_colour_hex": "#FFB703",
+          "glow_name": "electric_amber",
+          "glyph": "\u25c8",
+          "pattern_name": "dashed_line",
+          "uncertainty_badge_text": "\u25c8 [STATE: DERIVED \u00b7 MODE:COLOR:DERIVED]",
+          "uncertainty_state": "derived"
+        },
+        {
+          "border_pattern": "\u00b7\u00b7\u00b7 ///",
+          "color_mode": true,
+          "glow_colour_hex": "#9B5DE5",
+          "glow_name": "pulsing_violet_ghost",
+          "glyph": "\u25cc",
+          "pattern_name": "dotted_sparse_hatch_45deg",
+          "uncertainty_badge_text": "\u25cc [STATE: PREDICTED \u00b7 MODE:COLOR:PREDICTED]",
+          "uncertainty_state": "predicted"
+        },
+        {
+          "border_pattern": "\u22c0\u22c1\u22c0\u22c1",
+          "color_mode": true,
+          "glow_colour_hex": "#9C6644",
+          "glow_name": "desaturated_ochre",
+          "glyph": "\u231b",
+          "pattern_name": "sawtooth_notched",
+          "uncertainty_badge_text": "\u231b [STATE: STALE \u00b7 MODE:COLOR:STALE]",
+          "uncertainty_state": "stale"
+        },
+        {
+          "border_pattern": "\u2573\u2573\u2573 ?",
+          "color_mode": true,
+          "glow_colour_hex": "#FF006E",
+          "glow_name": "high_contrast_magenta_grey",
+          "glyph": "?",
+          "pattern_name": "cross_hatched_question",
+          "uncertainty_badge_text": "? [STATE: UNKNOWN \u00b7 MODE:COLOR:UNKNOWN]",
+          "uncertainty_state": "unknown"
+        }
+      ],
+      "no_colour_overlays": [
+        {
+          "border_pattern": "\u2550\u2550\u2550",
+          "color_mode": false,
+          "glow_colour_hex": null,
+          "glow_name": "monochrome_pattern_only",
+          "glyph": "\u25c9",
+          "pattern_name": "solid_double_line",
+          "uncertainty_badge_text": "\u25c9 [STATE: VERIFIED \u00b7 MODE:PLAIN:VERIFIED]",
+          "uncertainty_state": "verified"
+        },
+        {
+          "border_pattern": "\u2500\u2500\u2500 \u2500\u2500\u2500",
+          "color_mode": false,
+          "glow_colour_hex": null,
+          "glow_name": "monochrome_pattern_only",
+          "glyph": "\u25c8",
+          "pattern_name": "dashed_line",
+          "uncertainty_badge_text": "\u25c8 [STATE: DERIVED \u00b7 MODE:PLAIN:DERIVED]",
+          "uncertainty_state": "derived"
+        },
+        {
+          "border_pattern": "\u00b7\u00b7\u00b7 ///",
+          "color_mode": false,
+          "glow_colour_hex": null,
+          "glow_name": "monochrome_pattern_only",
+          "glyph": "\u25cc",
+          "pattern_name": "dotted_sparse_hatch_45deg",
+          "uncertainty_badge_text": "\u25cc [STATE: PREDICTED \u00b7 MODE:PLAIN:PREDICTED]",
+          "uncertainty_state": "predicted"
+        },
+        {
+          "border_pattern": "\u22c0\u22c1\u22c0\u22c1",
+          "color_mode": false,
+          "glow_colour_hex": null,
+          "glow_name": "monochrome_pattern_only",
+          "glyph": "\u231b",
+          "pattern_name": "sawtooth_notched",
+          "uncertainty_badge_text": "\u231b [STATE: STALE \u00b7 MODE:PLAIN:STALE]",
+          "uncertainty_state": "stale"
+        },
+        {
+          "border_pattern": "\u2573\u2573\u2573 ?",
+          "color_mode": false,
+          "glow_colour_hex": null,
+          "glow_name": "monochrome_pattern_only",
+          "glyph": "?",
+          "pattern_name": "cross_hatched_question",
+          "uncertainty_badge_text": "? [STATE: UNKNOWN \u00b7 MODE:PLAIN:UNKNOWN]",
+          "uncertainty_state": "unknown"
+        }
+      ],
+      "pass": true
+    },
+    "E8_silent_diagnostic_render": {
+      "default_agent_feed_count": 2,
+      "diagnostic_in_default_feed": false,
+      "diagnostic_render": {
+        "border_pattern": "\u2500\u2500\u2500 \u2500\u2500\u2500",
+        "confidence": "high",
+        "created_at": "2026-10-29T22:35:26.000Z",
+        "glow_colour_hex": "#FFB703",
+        "layer_isolation": "diagnostic_plane",
+        "observation_receipt_id": null,
+        "observed": false,
+        "provenance_refs": [
+          {
+            "ref_id": "src_fix_01",
+            "ref_type": "source",
+            "ref_version": "v2"
+          }
+        ],
+        "render_id": "rnd_0004_diagnostic",
+        "render_type": "diagnostic",
+        "source": "measurement",
+        "uncertainty_badge_text": "\u25c8 [STATE: DERIVED \u00b7 CONF:HIGH]",
+        "uncertainty_state": "derived",
+        "visibility_policy": "silent_diagnostic"
+      },
+      "diagnostic_retrievable_on_opt_in": true,
+      "pass": true
+    },
+    "E9_observation_window": {
+      "blocked_observation_attempts": 3,
+      "false_observation_count": 0,
+      "forged_receipt_attempt": {
+        "error_code": "ERR_UNVERIFIED_OBSERVATION_CLAIM",
+        "observed": false,
+        "reason": "ObservationReceipt signature or ledger binding failed verification.",
+        "render_id": "rnd_0001_derived",
+        "status": "rejected"
+      },
+      "legitimate_observed_promotion": {
+        "error_code": null,
+        "observation_receipt_id": "obs_rcpt_0001",
+        "observed": true,
+        "render": {
+          "border_pattern": "\u2550\u2550\u2550",
+          "confidence": "high",
+          "created_at": "2026-10-29T22:35:26.000Z",
+          "glow_colour_hex": "#00F5D4",
+          "layer_isolation": "verified_plane",
+          "observation_receipt_id": "obs_rcpt_0001",
+          "observed": true,
+          "provenance_refs": [
+            {
+              "ref_id": "src_cap_01",
+              "ref_type": "source",
+              "ref_version": "v1"
+            }
+          ],
+          "render_id": "rnd_0005_observed",
+          "render_type": "observed",
+          "source": "verified_pixels",
+          "uncertainty_badge_text": "\u25c9 [STATE: VERIFIED \u00b7 CONF:HIGH]",
+          "uncertainty_state": "verified",
+          "visibility_policy": "agent_visible"
+        },
+        "render_id": "rnd_0005_observed",
+        "status": "ok"
+      },
+      "pass": true,
+      "self_certification_blocked": true,
+      "unreceipted_attempt": {
+        "error_code": "ERR_UNVERIFIED_OBSERVATION_CLAIM",
+        "observed": false,
+        "reason": "Missing or incomplete ObservationReceipt.",
+        "render_id": "rnd_0001_derived",
+        "status": "rejected"
+      },
+      "valid_receipt": {
+        "captured_source_id": "src_cap_01",
+        "captured_source_version": "v1",
+        "observation_receipt_id": "obs_rcpt_0001",
+        "pipeline_stage": "verified_observation_window",
+        "receipt_signature": "hmac-sha256:3b69722e380643c37484fc5d2cc51bdf8837505f01c2dda1d9cbfb8aa1ac1b36",
+        "render_id": "rnd_0005_observed"
+      }
+    }
+  }
+}

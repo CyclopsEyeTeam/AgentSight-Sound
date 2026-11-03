@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "electric-sight-and-sound"
+version = "1.0.0"
+description = "Deterministic, zero-leakage Electric Sight & Chargeable-Byte Sound perception enclave for AI agents."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+keywords = [
+    "agents",
+    "computer-vision",
+    "audio-perception",
+    "chargeable-bytes",
+    "neuromorphic-audio",
+    "multimodal-fusion",
+    "epistemic-hygiene",
+    "simd",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+    "Topic :: Multimedia :: Graphics",
+]
+dependencies = []
+
+[tool.setuptools]
+py-modules = [
+    "electric_eye_harness",
+    "exec_gate_daemons",
+    "prod_gate_enclave",
+    "electric_vision_agent_bridge",
+    "electric_vision_cli",
+    "electric_audio_agent_bridge",
+    "electric_audio_cli",
+]
