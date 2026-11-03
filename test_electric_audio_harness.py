@@ -9,6 +9,7 @@ Unit and Integration Verification Suite for the Chargeable-Byte Electric Audio
 from __future__ import annotations
 
 import json
+import math
 import unittest
 
 from electric_audio_agent_bridge import (
@@ -384,6 +385,44 @@ class TestElectricAudioAndSightSoundHarness(unittest.TestCase):
         self.assertIn("four_band_polyphonic_profile", drop_res)
         self.assertIn("dynamic_and_tempo_profile", drop_res)
         self.assertTrue(drop_res["dynamic_and_tempo_profile"]["section_drop_detected"])
+
+    def test_tier2_tempo_tracks_beat_not_slot_folding_artifact(self) -> None:
+        # Regression: tempo used to be folded from ~470 ms slot onsets, so sparse
+        # clips collapsed to exactly 128 BPM regardless of the real beat.
+        sr = 16000
+        consent = {"consented": True, "token_id": "tok_tempo"}
+
+        def drum_loop(bpm: float, seconds: float) -> list:
+            n = int(sr * seconds)
+            beat = 60.0 / bpm
+            seed = 12345
+            pcm = []
+            for i in range(n):
+                t = i / sr
+                tb = t % beat
+                te = t % (beat / 2.0)
+                seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+                noise = (seed / 0x3FFFFFFF) - 1.0
+                kick = 16000.0 * math.exp(-tb * 30.0) * math.sin(2.0 * math.pi * 60.0 * tb)
+                hat = 5000.0 * math.exp(-te * 120.0) * noise
+                pad = 2000.0 * math.sin(2.0 * math.pi * 220.0 * t)
+                pcm.append(int(kick + hat + pad))
+            return pcm
+
+        for true_bpm in (92.0, 128.0, 150.0):
+            res = validate_and_translate_consented_pcm_samples(
+                drum_loop(true_bpm, 20.0), sample_rate_hz=sr, consent_token=consent,
+                time_slots=128, freq_bands=32,
+            )
+            dyn = res["dynamic_and_tempo_profile"]
+            self.assertLess(abs(dyn["estimated_bpm_x10"] / 10.0 - true_bpm) / true_bpm, 0.02, (true_bpm, dyn))
+            self.assertGreater(dyn["tempo_confidence_q16"], 0)
+
+        short = validate_and_translate_consented_pcm_samples(
+            drum_loop(120.0, 0.5), sample_rate_hz=sr, consent_token=consent, time_slots=128, freq_bands=32,
+        )
+        self.assertEqual(short["dynamic_and_tempo_profile"]["estimated_bpm"], 0)
+        self.assertEqual(short["dynamic_and_tempo_profile"]["tempo_confidence_q16"], 0)
 
 
 if __name__ == "__main__":

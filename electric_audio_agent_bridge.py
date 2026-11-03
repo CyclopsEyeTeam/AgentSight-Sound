@@ -3331,6 +3331,76 @@ def explain_charge_push_up_trace(
     return out
 
 
+TEMPO_BPM_MIN = 70.0
+TEMPO_BPM_MAX = 185.0
+
+
+def _estimate_tempo_onset_autocorr(
+    pcm_samples_i16: Sequence[int],
+    sample_rate_hz: int,
+    dc_offset_i16: int = 0,
+) -> Tuple[float, float]:
+    """
+    Estimates tempo from a 10 ms onset-strength envelope via autocorrelation.
+
+    Onset strength = positive flux of log energy in two lanes (broadband for
+    kick/bass, first-difference for hat/snare transients), minus a ~0.5 s moving
+    mean. The autocorrelation peak inside [TEMPO_BPM_MIN, TEMPO_BPM_MAX] is
+    refined to a sub-frame lag by parabolic interpolation.
+
+    Returns (bpm, confidence in 0..1); (0.0, 0.0) when the clip is under ~1 s
+    or carries no onset energy.
+    """
+    hop = max(1, int(sample_rate_hz) // 100)
+    n_hops = len(pcm_samples_i16) // hop
+    if n_hops < 100:
+        return 0.0, 0.0
+    pcm = [max(-32768, min(32767, int(s))) for s in pcm_samples_i16[: n_hops * hop]]
+    log_full: List[float] = []
+    log_high: List[float] = []
+    for k in range(n_hops):
+        chunk = pcm[k * hop : (k + 1) * hop]
+        full = sum(abs(s - dc_offset_i16) for s in chunk)
+        high = sum(abs(b - a) for a, b in zip(chunk, chunk[1:]))
+        log_full.append(math.log1p(full / hop))
+        log_high.append(math.log1p(high / hop))
+
+    flux = [
+        max(0.0, log_full[i] - log_full[i - 1]) + max(0.0, log_high[i] - log_high[i - 1])
+        for i in range(1, n_hops)
+    ]
+    n = len(flux)
+    half_win = 25
+    prefix = [0.0]
+    for f in flux:
+        prefix.append(prefix[-1] + f)
+    onset = []
+    for i in range(n):
+        lo, hi = max(0, i - half_win), min(n, i + half_win)
+        onset.append(max(0.0, flux[i] - (prefix[hi] - prefix[lo]) / (hi - lo)))
+
+    def autocorr(lag: int) -> float:
+        if lag >= n:
+            return 0.0
+        return sum(a * b for a, b in zip(onset, onset[lag:])) / (n - lag)
+
+    r0 = autocorr(0)
+    if r0 <= 0.0:
+        return 0.0, 0.0
+    fps = sample_rate_hz / float(hop)
+    lag_lo = int(math.floor(fps * 60.0 / TEMPO_BPM_MAX))
+    lag_hi = int(math.ceil(fps * 60.0 / TEMPO_BPM_MIN))
+    scores = {lag: autocorr(lag) for lag in range(lag_lo - 1, lag_hi + 2)}
+    best_lag = max(range(lag_lo, lag_hi + 1), key=lambda lag: scores[lag])
+
+    a, b, c = scores[best_lag - 1], scores[best_lag], scores[best_lag + 1]
+    curvature = a - 2.0 * b + c
+    frac = 0.5 * (a - c) / curvature if curvature < 0.0 else 0.0
+    bpm = 60.0 * fps / (best_lag + max(-0.5, min(0.5, frac)))
+    bpm = max(TEMPO_BPM_MIN, min(TEMPO_BPM_MAX, bpm))
+    return bpm, max(0.0, min(1.0, b / r0))
+
+
 def validate_and_translate_consented_pcm_samples(
     pcm_samples_i16: Sequence[int],
     *,
@@ -3546,20 +3616,16 @@ def validate_and_translate_consented_pcm_samples(
     mean_slot_u8 = sum(total_slot_energies) // max(1, len(total_slot_energies))
     crest_q16 = (peak_slot_u8 << 16) // max(1, mean_slot_u8)
 
-    # Count distinct onset peaks for tempo cadence
-    duration_sec = max(0.1, n_samples / float(sample_rate_hz))
+    # Count distinct slot-level onset peaks (coarse section cadence, not tempo)
     onset_slots: List[int] = []
     for i in range(1, len(total_slot_energies)):
         flux = total_slot_energies[i] - total_slot_energies[i - 1]
         if flux >= 14 and (not onset_slots or (i - onset_slots[-1]) >= 2):
             onset_slots.append(i)
-    onsets_per_sec = len(onset_slots) / duration_sec
-    # Map onset rate (typically 1.5 - 6.0 onsets/sec) into canonical musical BPM window [70..185]
-    raw_bpm = int(round(onsets_per_sec * 30.0))
-    while 0 < raw_bpm < 70:
-        raw_bpm *= 2
-    while raw_bpm > 185:
-        raw_bpm //= 2
+
+    # Tempo is measured on a 10 ms onset envelope, independent of `time_slots`:
+    # slot windows (~470 ms for 60 s / 128 slots) are as long as a beat and cannot resolve it.
+    tempo_bpm, tempo_conf = _estimate_tempo_onset_autocorr(pcm_samples_i16, sample_rate_hz, dc_offset_i16)
 
     return {
         "origin_attestation": origin_attestation,
@@ -3594,7 +3660,10 @@ def validate_and_translate_consented_pcm_samples(
             "drop_section_index": drop_section_idx,
             "section_drop_detected": bool(max_section_drop_delta >= 22),
             "onset_count": len(onset_slots),
-            "estimated_bpm": raw_bpm,
+            "estimated_bpm": int(round(tempo_bpm)),
+            "estimated_bpm_x10": int(round(tempo_bpm * 10.0)),
+            "tempo_confidence_q16": int(round(tempo_conf * 65536.0)),
+            "tempo_method": "onset_flux_autocorr_10ms_70_185bpm",
         },
         "translated_events": events,
     }
