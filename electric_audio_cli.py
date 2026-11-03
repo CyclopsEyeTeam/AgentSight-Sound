@@ -28,6 +28,7 @@ from electric_audio_agent_bridge import (
     ElectricSightAndSoundSession,
     calibrate_adaptive_charge_thresholds,
     explain_charge_push_up_trace,
+    run_horizontal_charge_and_vibration_test_plan,
     run_realtime_fusion_test_plan,
     run_tier2_fidelity_adversarial_and_edge_profile,
 )
@@ -101,6 +102,7 @@ def render_audio_inspect_terminal_output(
         f"  Spectral Centroid  : {spec['nominal_centroid_hz']} Hz (band_q16={spec['centroid_band_q16']})",
         f"  Event Islands (4C) : {cc['component_count']} (bbox={cc['foreground_bbox']})",
         f"  Refractory Guard   : saturated={ref['saturated_cell_count']}, clamped={ref['refractory_clamped_count']}",
+        f"  Vibration & Spread : q_vibe={cm.get('op_bass_vibration_energy_u8', 0)}, h_spread_q16={cm.get('op_horizontal_charge_spread_index_q16', 0)}, salience_q16={cm.get('op_tactile_salience_q16', 0)} ({cm.get('op_vibration_and_horizontal_profile', {}).get('physicality_interpretation', {}).get('regime', 'no_tactile_content')})",
         f"  Perceptual aHash64 : {cm['op_perceptual_audio_hash_ahash64']}",
         f"  Replay Digest      : {report['audio_replay_digest']}",
     ]
@@ -351,6 +353,7 @@ def run_cli(argv: Optional[Sequence[str]] = None) -> tuple[int, str]:
         play_pushed = av_rep["sound"]["charge_metrics"]["op_charge_summary_u8"]["pushed_up_active_bytes"]
         sight_objs = av_rep["sight"]["native_simd_metrics"]["op_connected_components_4c"]["component_count"]
         rt_plan = run_realtime_fusion_test_plan()
+        hv_plan = run_horizontal_charge_and_vibration_test_plan()
         tier2_prof = run_tier2_fidelity_adversarial_and_edge_profile()
         all_ok = bool(
             rest_pushed == 0
@@ -359,6 +362,7 @@ def run_cli(argv: Optional[Sequence[str]] = None) -> tuple[int, str]:
             and av_rep["sound"]["render"]["observed"] is True
             and av_rep["sight"]["render"]["observed"] is True
             and rt_plan["all_passed"] is True
+            and hv_plan["all_passed"] is True
             and tier2_prof["all_passed"] is True
         )
         payload = {
@@ -369,6 +373,7 @@ def run_cli(argv: Optional[Sequence[str]] = None) -> tuple[int, str]:
             "projected_sight_components": sight_objs,
             "joint_salience_q16": av_rep["multimodal_fusion"]["joint_salience_q16"],
             "realtime_fusion_tests_a_b_c_d_ablation": rt_plan,
+            "horizontal_charge_and_vibration_tests_e_to_j": hv_plan,
             "tier2_fidelity_adversarial_and_edge_profile": tier2_prof,
             "semantic_boundary_contract_id": SEMANTIC_BOUNDARY_CONTRACT["contract_id"],
             "audio_replay_digest": av_rep["sound"]["audio_replay_digest"],
@@ -389,6 +394,7 @@ def run_cli(argv: Optional[Sequence[str]] = None) -> tuple[int, str]:
             f"  Played Charged-Up  : {play_pushed} pushed-up bytes (PASS)",
             f"  Sight Projection   : {sight_objs} connected visual components (PASS)",
             f"  Tests A/B/C/D+Abl  : {'PASS' if rt_plan['all_passed'] else 'FAIL'} (100ms align_id + Electrical Area)",
+            f"  Tests E/F/G/H/I/J  : {'PASS' if hv_plan['all_passed'] else 'FAIL'} (8B VibrationPacket + Horizontal Spread + Haptic Safety)",
             f"  Tier-2 + Adv + Edge: {'PASS' if tier2_prof['all_passed'] else 'FAIL'} (batch={tier2_prof['edge_profile']['batch_200_packets_elapsed_ms']}ms)",
             f"  Boundary Contract  : {SEMANTIC_BOUNDARY_CONTRACT['contract_id']}",
             f"  Joint Salience Q16 : {payload['joint_salience_q16']}",

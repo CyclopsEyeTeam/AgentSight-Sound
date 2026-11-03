@@ -26,9 +26,10 @@ It is designed to be **connected to an infinite number of upstream producers and
 2. **Deterministic Electric Vision (`128x128` to `1920x1080`)**:
    - 10 closed-form integer/`Q16.16` spatial operators + native C11/AVX2 (`prod_gate_native_simd.c`) & Rust (`#![forbid(unsafe_code)]`, `prod_gate_native_simd.rs`) SIMD operators (`10,000/10,000` differential fuzz parity, `0` divergences).
    - Continuous streaming ring-buffer (`ContinuousElectricEyeStream`) with `explicit_bzero` zeroization on frame eviction, $16\times16$ dirty-tile bitmasks, and automatic `verified -> stale` epistemic decay watchdogs.
-3. **Three-Clock Multimodal Fusion & Working-Memory "Electrical Area"**:
-   - Packs visual (`modality=0`), audio (`modality=1`), and fused (`modality=2`) events into a **16-byte binary `ChargePacket`**.
-   - Time-aligns visual and auditory push-ups within `100 ms` `align_id` windows inside a sliding 3-second [`AgentElectricalAreaBuffer`](electric_audio_agent_bridge.py) with deduplication, half-life decay eviction, and `revision=1` tokens.
+3. **Three-Clock Multimodal Fusion, Horizontal Charge Spread & 8-Byte `VibrationPacket` (Option B)**:
+   - Packs visual (`modality=0`), audio (`modality=1`), fused audiovisual (`modality=2`), and fused audiovisual+tactile (`modality=3`) events into a **16-byte binary `ChargePacket`**, alongside a parallel **8-byte `VibrationPacket` (`>IHBB`: `t`, `align_id`, `q_vibe`, `h_spread`)**.
+   - Models lateral spectral leakage via [`apply_horizontal_spread()`](electric_audio_agent_bridge.py) (wide `0.40–0.50` spread for `20–120 Hz` bass down to focused `0.05–0.10` for treble) and adds **Operators 11–13** (`op_horizontal_charge_spread_index_q16`, `op_bass_vibration_energy_u8`, `op_tactile_salience_q16`).
+   - Time-aligns visual, auditory, and tactile push-ups within `100 ms` `align_id` windows inside [`AgentElectricalAreaBuffer`](electric_audio_agent_bridge.py) (with a 30% vibration budget cap) and drives external motors safely through [`HapticActuator`](electric_audio_agent_bridge.py) (6 safety gates: consent, rate limiter, `<=80%` intensity cap, `30s` duration auto-stop, `<100ms` kill switch, and `20 Hz` infrasound floor).
 4. **Strict Epistemic Hygiene (`SEMANTIC_BOUNDARY_CONTRACT`)**:
    - **Enclave Sensor Layer (`is_enclave_truth=True`, `claims_semantic_meaning=False`)**: Emits deterministic pixel/charge measurements, explainable push-up traces, and HMAC-SHA256 countersigned receipts (`ObservationReceipt`).
    - **Agent Interpreter Layer (`is_enclave_truth=False`)**: External LLM/ASR/mood interpretations and coalesced narrations ([`AgentNarrationStateMachine`](electric_audio_agent_bridge.py)) are wrapped in [`create_agent_interpretation_envelope()`](electric_audio_agent_bridge.py) so stochastic hypotheses are never confused with sensor truth.
@@ -185,7 +186,7 @@ Tested across 10 real-world tracks spanning a cappella, hip-hop, nu-metal, acous
 | [`electric_audio_agent_bridge.py`](electric_audio_agent_bridge.py) | Chargeable-Byte Electric Audio bridge, [`ContinuousElectricEarStream`](electric_audio_agent_bridge.py), [`ElectricSightAndSoundSession`](electric_audio_agent_bridge.py), 16-byte `ChargePacket`, [`AgentElectricalAreaBuffer`](electric_audio_agent_bridge.py), and Tier-2 4-band PCM validator. |
 | [`electric_audio_cli.py`](electric_audio_cli.py) | Standalone Electric Audio & Sight+Sound CLI (`cyclops-ea-ctl`). |
 | [`examples/connect_anything_demo.py`](examples/connect_anything_demo.py) | Universal connector script demonstrating Sight+Sound, Tier-2 PCM, and 16-byte `ChargePacket` fusion. |
-| [`test_electric_eye_harness.py`](test_electric_eye_harness.py) / [`test_electric_audio_harness.py`](test_electric_audio_harness.py) | Complete 31-suite unit & integration verification harness. |
+| [`test_electric_eye_harness.py`](test_electric_eye_harness.py) / [`test_electric_audio_harness.py`](test_electric_audio_harness.py) | Complete 33-suite unit & integration verification harness (including Tests A–J). |
 
 ---
 

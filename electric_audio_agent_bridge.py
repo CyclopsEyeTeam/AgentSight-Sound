@@ -119,9 +119,21 @@ TONE_ALPHABET_SLOT_MS = 150.0
 TONE_ALPHABET_SPACE_MS = 300.0
 TONE_ALPHABET_FADE_MS = 10.0
 
-# Frequency analysis span (55 Hz A1 to 7040 Hz A8 = 7 octaves)
-MIN_FREQ_HZ = 55.0
+# Frequency analysis span (20 Hz sub-bass floor to 7040 Hz A8; infrasound < 20 Hz prohibited)
+SUB_BASS_FLOOR_HZ = 20.0
+BASS_VIBRATION_MAX_HZ = 120.0
+MIN_FREQ_HZ = 20.0
 MAX_FREQ_HZ = 7040.0
+
+# Bass / Vibration Lane (q_vibe) constants
+VIBE_DECAY_Q8 = 248
+VIBE_SCALE = 0.50
+DEFAULT_PUSH_THRESHOLD_VIBE = 20
+DEFAULT_VIBE_HALF_LIFE_MS = 4000
+HAPTIC_INTENSITY_CAP = 0.80
+HAPTIC_MAX_CHANGES_PER_SEC = 10
+HAPTIC_MAX_CONTINUOUS_MS = 30000
+
 
 
 def tone_alphabet_index_to_hz(index: int) -> float:
@@ -184,25 +196,188 @@ def tone_alphabet_text_to_events(text: str) -> Dict[str, Any]:
 
 
 def _hz_to_band_index(freq_hz: float, freq_bands: int) -> int:
-    """Maps a frequency in Hz [55..7040] to a logarithmic band index [0..freq_bands-1]."""
+    """
+    Maps a frequency in Hz [20..7040] to a 4-zone logarithmic band index [0..freq_bands-1]:
+      - Bands 0..3   (scaled): 20-120 Hz   (Bass / Vibration lane)
+      - Bands 4..7   (scaled): 120-400 Hz  (Upper bass)
+      - Bands 8..15  (scaled): 400-2000 Hz (Mids)
+      - Bands 16..31 (scaled): 2000-7040 Hz (Treble)
+    """
     clamped = max(MIN_FREQ_HZ, min(MAX_FREQ_HZ, float(freq_hz)))
-    octaves = math.log2(clamped / MIN_FREQ_HZ)
-    max_octaves = math.log2(MAX_FREQ_HZ / MIN_FREQ_HZ)  # 7.0 octaves
-    norm = octaves / max_octaves
-    return max(0, min(freq_bands - 1, int(round(norm * (freq_bands - 1)))))
+    scale = float(freq_bands) / 32.0
+    b_bass_max = max(0, (freq_bands // 8) - 1)
+    b_upbass_min = b_bass_max + 1
+    b_upbass_max = max(b_upbass_min, (freq_bands // 4) - 1)
+    b_mid_min = b_upbass_max + 1
+    b_mid_max = max(b_mid_min, (freq_bands // 2) - 1)
+    b_treb_min = b_mid_max + 1
+
+    if clamped <= 120.0:
+        ratio = math.log2(clamped / 20.0) / math.log2(120.0 / 20.0)
+        b_idx = int(round(ratio * b_bass_max))
+        return max(0, min(b_bass_max, b_idx))
+    if clamped <= 400.0:
+        ratio = math.log2(clamped / 120.0) / math.log2(400.0 / 120.0)
+        b_idx = int(round((3.5 * scale) + (3.9 * scale) * ratio))
+        return max(b_upbass_min, min(b_upbass_max, b_idx))
+    if clamped <= 2000.0:
+        ratio = math.log2(clamped / 400.0) / math.log2(2000.0 / 400.0)
+        b_idx = int(round(b_mid_min + (b_mid_max - b_mid_min) * ratio))
+        return max(b_mid_min, min(b_mid_max, b_idx))
+    ratio = math.log2(clamped / 2000.0) / math.log2(MAX_FREQ_HZ / 2000.0)
+    b_idx = int(round(b_treb_min + ((freq_bands - 1) - b_treb_min) * ratio))
+    return max(b_treb_min, min(freq_bands - 1, b_idx))
 
 
 def _band_index_to_hz(band_idx: int, freq_bands: int) -> int:
-    """Maps a logarithmic band index [0..freq_bands-1] back to nominal integer Hz."""
+    """Maps a 4-zone logarithmic band index [0..freq_bands-1] back to nominal integer Hz."""
     if freq_bands <= 1:
         return int(round(MIN_FREQ_HZ))
-    norm = max(0.0, min(1.0, float(band_idx) / float(freq_bands - 1)))
-    max_octaves = math.log2(MAX_FREQ_HZ / MIN_FREQ_HZ)
-    return int(round(MIN_FREQ_HZ * math.pow(2.0, norm * max_octaves)))
+    b = max(0, min(freq_bands - 1, int(band_idx)))
+    b_bass_max = max(1, (freq_bands // 8) - 1)
+    b_upbass_min = b_bass_max + 1
+    b_upbass_max = max(b_upbass_min + 1, (freq_bands // 4) - 1)
+    b_mid_min = b_upbass_max + 1
+    b_mid_max = max(b_mid_min + 1, (freq_bands // 2) - 1)
+    b_treb_min = b_mid_max + 1
+
+    if b <= b_bass_max:
+        ratio = float(b) / float(max(1, b_bass_max))
+        return int(round(20.0 * math.pow(120.0 / 20.0, ratio)))
+    if b <= b_upbass_max:
+        ratio = float(b - b_upbass_min) / float(max(1, b_upbass_max - b_upbass_min))
+        return int(round(120.0 * math.pow(400.0 / 120.0, ratio)))
+    if b <= b_mid_max:
+        ratio = float(b - b_mid_min) / float(max(1, b_mid_max - b_mid_min))
+        return int(round(400.0 * math.pow(2000.0 / 400.0, ratio)))
+    ratio = float(b - b_treb_min) / float(max(1, (freq_bands - 1) - b_treb_min))
+    return int(round(2000.0 * math.pow(MAX_FREQ_HZ / 2000.0, ratio)))
 
 
 def _midi_to_hz(midi_note: float) -> float:
     return 440.0 * math.pow(2.0, (float(midi_note) - 69.0) / 12.0)
+
+
+def get_bass_band_indices(freq_bands: int = 32) -> List[int]:
+    """Returns the band indices corresponding to the 20-120 Hz bass/vibration lane (bands 0..3 on 32-band grid)."""
+    n_bass = max(1, int(freq_bands) // 8)
+    return list(range(n_bass))
+
+
+def default_band_spread_factors(freq_bands: int = 32) -> List[float]:
+    """
+    Returns per-band horizontal spectral spread factors (0.0-0.5) by frequency zone:
+      - Band range 0-3   (20-120 Hz)    : 0.40-0.50 (Bass bleeds wide)
+      - Band range 4-7   (120-400 Hz)   : 0.25-0.35 (Upper bass, moderate spread)
+      - Band range 8-15  (400-2000 Hz)  : 0.10-0.20 (Mids, focused)
+      - Band range 16-31 (2000-20000 Hz): 0.05-0.10 (Treble, very focused)
+    Monotonically decreases from 0.50 at band 0 down to 0.05 at band freq_bands-1.
+    """
+    n = max(1, int(freq_bands))
+    b_bass_max = max(0, (n // 8) - 1)
+    b_upbass_min = b_bass_max + 1
+    b_upbass_max = max(b_upbass_min, (n // 4) - 1)
+    b_mid_min = b_upbass_max + 1
+    b_mid_max = max(b_mid_min, (n // 2) - 1)
+    b_treb_min = b_mid_max + 1
+
+    factors: List[float] = []
+    for b in range(n):
+        if b <= b_bass_max:
+            frac = float(b) / float(max(1, b_bass_max))
+            sf = 0.50 - 0.10 * frac
+        elif b <= b_upbass_max:
+            frac = float(b - b_upbass_min) / float(max(1, b_upbass_max - b_upbass_min))
+            sf = 0.35 - 0.10 * frac
+        elif b <= b_mid_max:
+            frac = float(b - b_mid_min) / float(max(1, b_mid_max - b_mid_min))
+            sf = 0.20 - 0.10 * frac
+        else:
+            frac = float(b - b_treb_min) / float(max(1, (n - 1) - b_treb_min))
+            sf = 0.10 - 0.05 * frac
+        factors.append(round(sf, 4))
+    return factors
+
+
+def apply_horizontal_spread(
+    charge_row: Union[Sequence[int], bytearray],
+    spread_factors: Optional[Sequence[float]] = None,
+) -> List[int]:
+    """
+    charge_row:     1D array, charge per freq band for one time slot
+    spread_factors: 1D array, spread factor per band (0.0-0.5)
+    Returns: new row with lateral leakage applied (additive, saturates at 255)
+    """
+    result = list(charge_row.copy()) if hasattr(charge_row, "copy") else list(charge_row)
+    n = len(result)
+    if spread_factors is None:
+        spread_factors = default_band_spread_factors(n)
+    for b in range(n):
+        q = int(charge_row[b])
+        if q == 0:
+            continue
+        sf = float(spread_factors[b])
+        leak = int(q * sf)
+        if b > 0:
+            result[b - 1] = min(255, result[b - 1] + leak)
+        if b < n - 1:
+            result[b + 1] = min(255, result[b + 1] + leak)
+    return result
+
+
+def compute_q_vibe(
+    spectrum: Sequence[int],
+    bass_band_indices: Optional[Sequence[int]] = None,
+    *,
+    vibe_scale: float = VIBE_SCALE,
+) -> int:
+    """
+    Computes the 1-byte bass/vibration charge `q_vibe` (0-255) across the 20-120 Hz bass bands.
+    """
+    if bass_band_indices is None:
+        bass_band_indices = get_bass_band_indices(len(spectrum))
+    bass_energy = sum(int(spectrum[b]) for b in bass_band_indices if 0 <= b < len(spectrum))
+    q_vibe = min(255, max(0, int(bass_energy * vibe_scale)))
+    return q_vibe
+
+
+def interpret_tactile_physicality(q_vibe: int, h_spread: int) -> Dict[str, Any]:
+    """
+    Internal Tactile Physicality Interpreter mapping `(q_vibe, h_spread)` into the
+    4 canonical physicality regimes:
+      - High q_vibe + High h_spread -> "heavy_physical_presence" ("Heavy physical presence — bass drop, thunder, impact")
+      - High q_vibe + Low  h_spread -> "focused_low_tone"        ("Focused low tone — cello, hum, drone")
+      - Low  q_vibe + High h_spread -> "wide_ambient_rumble"     ("Wide but quiet — ambient rumble, distant traffic")
+      - Low  q_vibe + Low  h_spread -> "no_tactile_content"      ("No tactile content — speech, light music")
+    """
+    qv = max(0, min(255, int(q_vibe)))
+    hs = max(0, min(255, int(h_spread)))
+    high_vibe = qv >= 80
+    high_spread = hs >= 96
+
+    if high_vibe and high_spread:
+        regime = "heavy_physical_presence"
+        description = "Heavy physical presence — bass drop, thunder, impact"
+    elif high_vibe and not high_spread:
+        regime = "focused_low_tone"
+        description = "Focused low tone — cello, hum, drone"
+    elif not high_vibe and high_spread:
+        regime = "wide_ambient_rumble"
+        description = "Wide but quiet — ambient rumble, distant traffic"
+    else:
+        regime = "no_tactile_content"
+        description = "No tactile content — speech, light music"
+
+    salience_q16 = ((qv * hs) << 16) // (255 * 255)
+    return {
+        "q_vibe": qv,
+        "h_spread": hs,
+        "q_vibe_level": "high" if high_vibe else "low",
+        "h_spread_level": "high" if high_spread else "low",
+        "regime": regime,
+        "description": description,
+        "tactile_salience_q16": salience_q16,
+    }
 
 
 def _validate_audio_event_hygiene(event_dict: Dict[str, Any]) -> None:
@@ -350,16 +525,32 @@ def translate_audio_to_chargeable_bytes(
         else:
             f_hz = 440.0
 
+        # 20 Hz Sub-Bass Safety & Technical Floor (infrasound refused)
+        if f_hz < SUB_BASS_FLOOR_HZ:
+            raise ValueError(
+                f"ERR_SUB_BASS_PROHIBITED: infrasound frequency {f_hz} Hz < {SUB_BASS_FLOOR_HZ} Hz is prohibited"
+            )
+
         b0 = _hz_to_band_index(f_hz, freq_bands)
         b1 = b0
         harmonics = max(1, min(6, int(item.get("harmonics", 1))))
-        bandwidth_bands = max(0, min(16, int(item.get("bandwidth_bands", 1))))
+        default_bw = 1 if kind in ("pulse", "noise_burst") else 0
+        bandwidth_bands = max(0, min(16, int(item.get("bandwidth_bands", default_bw))))
 
         if kind == "sweep":
             f_end_hz = float(item.get("end_freq_hz", item.get("freq_end_hz", f_hz * 2.0)))
+            if f_end_hz < SUB_BASS_FLOOR_HZ:
+                raise ValueError(
+                    f"ERR_SUB_BASS_PROHIBITED: infrasound sweep end frequency {f_end_hz} Hz < {SUB_BASS_FLOOR_HZ} Hz is prohibited"
+                )
             b1 = _hz_to_band_index(f_end_hz, freq_bands)
         elif kind == "chord":
             freqs = item.get("frequencies_hz") or [f_hz, f_hz * 1.25, f_hz * 1.5]
+            for cf in freqs:
+                if float(cf) < SUB_BASS_FLOOR_HZ:
+                    raise ValueError(
+                        f"ERR_SUB_BASS_PROHIBITED: infrasound chord frequency {cf} Hz < {SUB_BASS_FLOOR_HZ} Hz is prohibited"
+                    )
             chord_bands = [_hz_to_band_index(float(cf), freq_bands) for cf in freqs]
             b0 = min(chord_bands)
             b1 = max(chord_bands)
@@ -423,11 +614,14 @@ def _compile_chargeable_byte_potentials(
     specs: Sequence[Dict[str, Any]],
     time_slots: int,
     freq_bands: int,
+    *,
+    enable_horizontal_spread: bool = True,
 ) -> Tuple[bytes, bytes]:
     """
     Compiles normalized audio specs into:
       1. `potential_bytes` (`time_slots * freq_bands` `uint8` `0..255`):
-         latent chargeable byte capacity at each `(t, b)` slot.
+         latent chargeable byte capacity at each `(t, b)` slot, with optional
+         spectral horizontal charge spread (`apply_horizontal_spread`).
       2. `novelty_bytes` (`time_slots * freq_bands` `uint8` `0..255`):
          positive onset/transient energy (`max(0, potential[t, b] - potential[t-1, b])`).
 
@@ -449,7 +643,7 @@ def _compile_chargeable_byte_potentials(
         peak_u8 = int(spec["potential_u8"])
         att = int(spec.get("attack_slots", 1))
         rel = int(spec.get("release_slots", 1))
-        bw = int(spec.get("bandwidth_bands", 1))
+        bw = int(spec.get("bandwidth_bands", 0))
         harmonics = int(spec.get("harmonics", 1))
         span_t = max(1, t1 - t0 + 1)
 
@@ -495,6 +689,33 @@ def _compile_chargeable_byte_potentials(
                     if h_u8 > 0:
                         _add_potential(t, h_band, h_u8)
 
+    # Apply Horizontal Spectral Charge Spread per time slot
+    if enable_horizontal_spread:
+        spread_factors = default_band_spread_factors(freq_bands)
+        upbass_limit = max(4, freq_bands // 4)
+        mid_limit = max(8, freq_bands // 2)
+        for t in range(time_slots):
+            t_off = t * freq_bands
+            raw_row = pot_buf[t_off : t_off + freq_bands]
+            if not any(raw_row):
+                continue
+            spread_row = apply_horizontal_spread(raw_row, spread_factors)
+            # Second-hop low-frequency bass skirt (bounded within low/mid bands so bass never bleeds into high treble)
+            for b in range(min(freq_bands, upbass_limit)):
+                q = raw_row[b]
+                if q == 0:
+                    continue
+                sf = spread_factors[b]
+                leak2 = int(q * sf * sf)
+                if leak2 > 0:
+                    left_b = max(0, b - 2)
+                    spread_row[left_b] = min(255, spread_row[left_b] + leak2)
+                    right_b = b + 2
+                    if right_b < mid_limit:
+                        spread_row[right_b] = min(255, spread_row[right_b] + leak2)
+            for b in range(freq_bands):
+                pot_buf[t_off + b] = spread_row[b]
+
     # Compute onset novelty bytes: positive rise delta across time slots
     nov_buf = bytearray(total_cells)
     for t in range(time_slots):
@@ -523,6 +744,7 @@ def _simulate_causal_playhead_charging(
     playhead_slot: int,
     fast_decay_q8: int = 200,
     slow_decay_q8: int = 252,
+    vibe_decay_q8: int = VIBE_DECAY_Q8,
     max_push_up_step: int = 240,
     refractory_threshold: int = 220,
     refractory_ticks: int = 2,
@@ -534,10 +756,12 @@ def _simulate_causal_playhead_charging(
         uncharged at `0` (resting baseline).
       - As the playhead sweeps across `s = 0 .. playhead_slot`:
           * Existing charge across `0 .. s-1` decays via multi-scale Q8 factors:
-              - `fast_charge` decays rapidly (`fast_decay_q8 / 256`, default 160/256)
+              - `fast_charge` decays rapidly (`fast_decay_q8 / 256`, default 200/256)
                 to isolate transients/onsets.
-              - `slow_charge` decays slowly (`slow_decay_q8 / 256`, default 232/256)
+              - `slow_charge` decays slowly (`slow_decay_q8 / 256`, default 252/256)
                 to retain short-term pitch/timbre memory trace.
+              - `vibe_charge` (`q_vibe` across 20-120 Hz bass bands) decays at
+                `vibe_decay_q8 / 256` (248/256) with `2x` slow-lane refractory guard.
           * At the active playhead column `s`, bytes are pushed up:
               - If band `b` is in refractory cooldown from a prior saturation spike,
                 its push-up impulse is damped by `1/4` (refractory guard).
@@ -547,12 +771,13 @@ def _simulate_causal_playhead_charging(
               - Composite `pushed_up_bytes[t, b] = max(fast_charge[t, b], slow_charge[t, b])`.
 
     Returns the live charged byte arrays (kept strictly inside the closure vault)
-    plus refractory/saturation guard counters.
+    plus refractory/saturation guard counters and `vibe_slot_bytes` (`q_vibe`).
     """
     total_cells = time_slots * freq_bands
     fast_buf = bytearray(total_cells)
     slow_buf = bytearray(total_cells)
     comp_buf = bytearray(total_cells)
+    vibe_slot_buf = bytearray(time_slots)
 
     # If playhead_slot < 0, audio has not started playing: all bytes sit at resting 0
     if playhead_slot < 0:
@@ -560,19 +785,24 @@ def _simulate_causal_playhead_charging(
             "fast_bytes": bytes(fast_buf),
             "slow_bytes": bytes(slow_buf),
             "pushed_up_bytes": bytes(comp_buf),
+            "vibe_slot_bytes": bytes(vibe_slot_buf),
             "saturated_cell_count": 0,
             "refractory_clamped_count": 0,
+            "vibe_saturated_slot_count": 0,
+            "vibe_refractory_clamped_count": 0,
             "active_playhead_slot": -1,
         }
 
     clamped_playhead = min(time_slots - 1, int(playhead_slot))
     band_cooldown = [0] * freq_bands
+    vibe_cooldown = 0
+    vibe_refractory_ticks = max(1, int(refractory_ticks) * 2)
+    bass_indices = get_bass_band_indices(freq_bands)
     saturated_cell_count = 0
     refractory_clamped_count = 0
+    vibe_saturated_slot_count = 0
+    vibe_refractory_clamped_count = 0
 
-    # Precompute integer Q8 decay multipliers by age_ticks for O(1) lookup
-    # Wait: to preserve exact bit-for-bit parity with step-by-step >> 8 rounding,
-    # only iterate when fast_impulse > 0 or slow_impulse > 0!
     for s in range(clamped_playhead + 1):
         s_off = s * freq_bands
         age_ticks = clamped_playhead - s
@@ -615,17 +845,45 @@ def _simulate_causal_playhead_charging(
                 saturated_cell_count += 1
                 band_cooldown[b] = refractory_ticks
 
+        # Simulate Bass / Vibration Lane (q_vibe across 20-120 Hz bands with 2x refractory ticks)
+        slot_spectrum = potential_bytes[s_off : s_off + freq_bands]
+        raw_q_vibe = compute_q_vibe(slot_spectrum, bass_indices)
+        if raw_q_vibe == 0:
+            if vibe_cooldown > 0:
+                vibe_cooldown -= 1
+        else:
+            if vibe_cooldown > 0:
+                vibe_cooldown -= 1
+                vibe_refractory_clamped_count += 1
+                v_impulse = max(DEFAULT_PUSH_THRESHOLD_VIBE, raw_q_vibe >> 1)
+            else:
+                v_impulse = min(255, raw_q_vibe)
+                if raw_q_vibe >= refractory_threshold:
+                    vibe_saturated_slot_count += 1
+                    vibe_cooldown = vibe_refractory_ticks
+
+            v_val = v_impulse
+            for _ in range(age_ticks):
+                v_val = (v_val * vibe_decay_q8) >> 8
+                if v_val == 0:
+                    break
+            vibe_slot_buf[s] = min(255, v_val)
+
     out = {
         "fast_bytes": bytes(fast_buf),
         "slow_bytes": bytes(slow_buf),
         "pushed_up_bytes": bytes(comp_buf),
+        "vibe_slot_bytes": bytes(vibe_slot_buf),
         "saturated_cell_count": saturated_cell_count,
         "refractory_clamped_count": refractory_clamped_count,
+        "vibe_saturated_slot_count": vibe_saturated_slot_count,
+        "vibe_refractory_clamped_count": vibe_refractory_clamped_count,
         "active_playhead_slot": clamped_playhead,
     }
     explicit_zeroize_bytearray(fast_buf)
     explicit_zeroize_bytearray(slow_buf)
     explicit_zeroize_bytearray(comp_buf)
+    explicit_zeroize_bytearray(vibe_slot_buf)
     return out
 
 
@@ -639,13 +897,17 @@ def _run_10_audio_charge_operators(
     freq_bands: int,
     *,
     playhead_slot: int,
+    vibe_slot_bytes: Optional[bytes] = None,
     saturated_cell_count: int = 0,
     refractory_clamped_count: int = 0,
+    vibe_saturated_slot_count: int = 0,
+    vibe_refractory_clamped_count: int = 0,
     push_up_threshold_u8: int = 24,
     alert_threshold_u8: int = 180,
 ) -> Dict[str, Any]:
     """
-    Executes all 10 Closed-Form Chargeable-Byte Audio Operators using strictly
+    Executes all 13 Closed-Form Chargeable-Byte Audio & Vibration Operators
+    (Operators 1-10 + Horizontal Spread & Vibration Operators 11-13) using strictly
     integer and Q16.16 fixed-point arithmetic (zero IEEE-754 non-determinism).
     """
     total_cells = time_slots * freq_bands
@@ -990,6 +1252,54 @@ def _run_10_audio_charge_operators(
         },
     }
 
+    # 11. op_horizontal_charge_spread_index_q16 (0=narrow/point, 65536=full-spectrum; high for bass/chords, low for treble)
+    if sum_pushed > 0:
+        active_band_count = sum(1 for s in band_charge_sums if s > 0)
+        peak_band_charge = max(band_charge_sums)
+        off_peak_charge = max(0, sum_pushed - peak_band_charge)
+        off_peak_ratio_q16 = (off_peak_charge << 16) // sum_pushed
+        band_cov_q16 = (active_band_count << 16) // max(1, freq_bands)
+        op_h_spread_q16 = min(65536, (off_peak_ratio_q16 * 3 + band_cov_q16 * 2) // 4)
+        h_spread_u8 = min(255, max(0, (op_h_spread_q16 * 255) >> 16))
+    else:
+        op_h_spread_q16 = 0
+        h_spread_u8 = 0
+
+    # 12. op_bass_vibration_energy_u8 (20-120 Hz bass/vibration lane q_vibe 0..255)
+    bass_indices = get_bass_band_indices(freq_bands)
+    bass_charge_sum = sum(band_charge_sums[b] for b in bass_indices if 0 <= b < freq_bands)
+    high_band_charge_sum = sum(band_charge_sums[b] for b in range(freq_bands // 2, freq_bands))
+    if playhead_slot < 0 or sum_pushed == 0:
+        op_bass_vibe_u8 = 0
+    elif vibe_slot_bytes is not None and len(vibe_slot_bytes) == time_slots:
+        op_bass_vibe_u8 = min(255, max(vibe_slot_bytes[: clamped_ph + 1], default=0))
+    else:
+        # Derive from active playhead spectrum in 20-120 Hz bands
+        peak_bass_vibe = 0
+        for t in range(clamped_ph + 1):
+            t_off = t * freq_bands
+            qv_t = compute_q_vibe(pushed_up_bytes[t_off : t_off + freq_bands], bass_indices)
+            if qv_t > peak_bass_vibe:
+                peak_bass_vibe = qv_t
+        op_bass_vibe_u8 = peak_bass_vibe
+
+    # 13. op_tactile_salience_q16 (q_vibe * h_spread normalized to Q16.16)
+    op_tactile_salience_q16 = ((op_bass_vibe_u8 * h_spread_u8) << 16) // (255 * 255)
+    physicality_interp = interpret_tactile_physicality(op_bass_vibe_u8, h_spread_u8)
+
+    op_vibe_profile = {
+        "q_vibe_u8": op_bass_vibe_u8,
+        "h_spread_u8": h_spread_u8,
+        "horizontal_spread_index_q16": op_h_spread_q16,
+        "tactile_salience_q16": op_tactile_salience_q16,
+        "bass_band_indices": bass_indices,
+        "bass_band_charge_sum": bass_charge_sum,
+        "high_band_bleed_sum": high_band_charge_sum,
+        "vibe_saturated_slot_count": vibe_saturated_slot_count,
+        "vibe_refractory_clamped_count": vibe_refractory_clamped_count,
+        "physicality_interpretation": physicality_interp,
+    }
+
     return {
         "op_charge_summary_u8": op_charge_summary,
         "op_push_up_profile_q16": op_push_up_profile,
@@ -1002,13 +1312,18 @@ def _run_10_audio_charge_operators(
         "op_perceptual_audio_hash_ahash64": op_ahash64,
         "op_playhead_phase_profile": op_playhead_phase,
         "op_bbox_aligned_charge_diff_u8": op_diff,
+        "op_horizontal_charge_spread_index_q16": op_h_spread_q16,
+        "op_horizontal_charge_spread_index": op_h_spread_q16,
+        "op_bass_vibration_energy_u8": op_bass_vibe_u8,
+        "op_tactile_salience_q16": op_tactile_salience_q16,
+        "op_vibration_and_horizontal_profile": op_vibe_profile,
     }
 
 
 def _create_audio_charge_closure_vault() -> Dict[str, Callable[..., Any]]:
     """
     Private lexical closure vault for Chargeable-Byte Audio matrices.
-    Raw chargeable-byte arrays (`potential`, `novelty`, `fast`, `slow`, `pushed_up`)
+    Raw chargeable-byte arrays (`potential`, `novelty`, `fast`, `slow`, `pushed_up`, `vibe_slot`)
     remain strictly isolated inside this closure and are never exposed on instance
     attributes or returned in agent payloads.
     """
@@ -1026,12 +1341,18 @@ def _create_audio_charge_closure_vault() -> Dict[str, Callable[..., Any]]:
         fast_decay_q8: int = 200,
         slow_decay_q8: int = 252,
         refractory_ticks: int = 2,
+        enable_horizontal_spread: bool = True,
     ) -> Dict[str, Any]:
         key = (source_id, source_version)
         if key in _sources:
             raise ValueError(f"Immutable audio source {source_id}@{source_version} already registered")
 
-        pot_bytes, nov_bytes = _compile_chargeable_byte_potentials(specs, time_slots, freq_bands)
+        pot_bytes, nov_bytes = _compile_chargeable_byte_potentials(
+            specs,
+            time_slots,
+            freq_bands,
+            enable_horizontal_spread=enable_horizontal_spread,
+        )
         sim = _simulate_causal_playhead_charging(
             pot_bytes,
             nov_bytes,
@@ -1054,10 +1375,13 @@ def _create_audio_charge_closure_vault() -> Dict[str, Callable[..., Any]]:
             "fast_buf": bytearray(sim["fast_bytes"]),
             "slow_buf": bytearray(sim["slow_bytes"]),
             "pushed_up_buf": bytearray(sim["pushed_up_bytes"]),
+            "vibe_slot_buf": bytearray(sim["vibe_slot_bytes"]),
             "potential_sha256": potential_sha256,
             "charged_sha256": charged_sha256,
             "saturated_cell_count": sim["saturated_cell_count"],
             "refractory_clamped_count": sim["refractory_clamped_count"],
+            "vibe_saturated_slot_count": sim["vibe_saturated_slot_count"],
+            "vibe_refractory_clamped_count": sim["vibe_refractory_clamped_count"],
             "spec_count": len(specs),
         }
         return {
@@ -1096,8 +1420,11 @@ def _create_audio_charge_closure_vault() -> Dict[str, Callable[..., Any]]:
             ts,
             fb,
             playhead_slot=ea["playhead_slot"],
+            vibe_slot_bytes=bytes(ea["vibe_slot_buf"]),
             saturated_cell_count=ea["saturated_cell_count"],
             refractory_clamped_count=ea["refractory_clamped_count"],
+            vibe_saturated_slot_count=ea["vibe_saturated_slot_count"],
+            vibe_refractory_clamped_count=ea["vibe_refractory_clamped_count"],
         )
 
     def compute_dirty_charge_tiles_16x16(
@@ -1326,19 +1653,21 @@ def _create_audio_charge_closure_vault() -> Dict[str, Callable[..., Any]]:
         return marks
 
     def evict_source(source_key: Tuple[str, str]) -> Dict[str, Any]:
-        """Explicitly zeroizes (`explicit_bzero`) all 5 byte buffers of a single audio source."""
+        """Explicitly zeroizes (`explicit_bzero`) all byte buffers of a single audio source."""
         if source_key not in _sources:
             return {"evicted": False, "zeroized_bytes": 0, "remaining_sources": len(_sources)}
         entry = _sources.pop(source_key)
         wiped = 0
         for buf_name in ("potential_buf", "novelty_buf", "fast_buf", "slow_buf", "pushed_up_buf"):
             wiped += explicit_zeroize_bytearray(entry[buf_name])
+        vibe_wiped = explicit_zeroize_bytearray(entry["vibe_slot_buf"]) if "vibe_slot_buf" in entry else 0
         _zeroized_stats["evicted_frames"] += 1
         _zeroized_stats["zeroized_bytes"] += wiped
         return {
             "evicted": True,
             "evicted_source": {"source_id": source_key[0], "source_version": source_key[1]},
             "zeroized_bytes": wiped,
+            "vibe_zeroized_bytes": vibe_wiped,
             "remaining_sources": len(_sources),
             "cumulative_evicted_frames": _zeroized_stats["evicted_frames"],
             "cumulative_zeroized_bytes": _zeroized_stats["zeroized_bytes"],
@@ -1351,6 +1680,8 @@ def _create_audio_charge_closure_vault() -> Dict[str, Callable[..., Any]]:
         for entry in _sources.values():
             for buf_name in ("potential_buf", "novelty_buf", "fast_buf", "slow_buf", "pushed_up_buf"):
                 wiped += explicit_zeroize_bytearray(entry[buf_name])
+            if "vibe_slot_buf" in entry:
+                explicit_zeroize_bytearray(entry["vibe_slot_buf"])
         _sources.clear()
         _zeroized_stats["zeroized_bytes"] += wiped
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 4)
@@ -1440,6 +1771,7 @@ class ElectricAudioAgentSession:
         fast_decay_q8: int = 200,
         slow_decay_q8: int = 252,
         refractory_ticks: int = 2,
+        enable_horizontal_spread: bool = True,
         source_kind: str = "captured_frame",
         origin_attestation: str = "synthetic_fixture",
     ) -> Dict[str, Any]:
@@ -1501,6 +1833,7 @@ class ElectricAudioAgentSession:
             fast_decay_q8=fast_decay_q8,
             slow_decay_q8=slow_decay_q8,
             refractory_ticks=refractory_ticks,
+            enable_horizontal_spread=enable_horizontal_spread,
         )
         self._source_grids[(source_id, source_version)] = (ts, fb)
         self._source_specs[(source_id, source_version)] = specs
@@ -2529,6 +2862,7 @@ class ElectricSightAndSoundSession:
 MODALITY_VISION = 0
 MODALITY_AUDIO = 1
 MODALITY_FUSED = 2
+MODALITY_AUDIOVISUAL_TACTILE = 3
 
 LANE_FAST = 0
 LANE_SLOW = 1
@@ -2538,11 +2872,269 @@ DEFAULT_FAST_HALF_LIFE_MS = 50
 DEFAULT_SLOW_HALF_LIFE_MS = 1500
 DEFAULT_ALIGN_WINDOW_MS = 100
 DEFAULT_ELECTRICAL_AREA_WINDOW_MS = 3000
+DEFAULT_VIBRATION_WINDOW_MS = 4000
+MAX_VIBRATION_BUFFER_SHARE = 0.30
 
 
 def compute_align_id(timestamp_ms: int, align_window_ms: int = DEFAULT_ALIGN_WINDOW_MS) -> int:
     """Computes the deterministic 100 ms window alignment ID (`align_id`) for `timestamp_ms`."""
     return max(0, int(timestamp_ms)) // max(1, int(align_window_ms))
+
+
+def build_vibration_packet(
+    *,
+    t: int,
+    q_vibe: int = 0,
+    h_spread: int = 0,
+    push_threshold_vibe: int = DEFAULT_PUSH_THRESHOLD_VIBE,
+    align_window_ms: int = DEFAULT_ALIGN_WINDOW_MS,
+) -> Dict[str, Any]:
+    """
+    Constructs an Option B 8-byte parallel `VibrationPacket`:
+      - `t`        : uint32 (4 bytes) — timestamp ms
+      - `align_id` : uint16 (2 bytes) — links to charge packet in same 100 ms window
+      - `q_vibe`   : uint8  (1 byte)  — vibration charge 0-255 (bass energy, 20-120 Hz)
+      - `h_spread` : uint8  (1 byte)  — horizontal spread index 0-255 (0=narrow, 255=full spectrum)
+    Derived fields (not stored in the 8-byte wire format):
+      - `push`     : 1 if `q_vibe >= push_threshold_vibe` else 0
+      - `decay`    : fixed slow half-life (`DEFAULT_VIBE_HALF_LIFE_MS` = 4000 ms)
+      - `modality` : implicit (`MODALITY_AUDIOVISUAL_TACTILE = 3` when fused)
+    """
+    t_ms = max(0, int(t))
+    qv_u8 = max(0, min(255, int(q_vibe)))
+    hs_u8 = max(0, min(255, int(h_spread)))
+    align_id_u16 = compute_align_id(t_ms, align_window_ms) & 0xFFFF
+    push_bit = 1 if qv_u8 >= int(push_threshold_vibe) else 0
+    return {
+        "t": t_ms,
+        "align_id": align_id_u16,
+        "q_vibe": qv_u8,
+        "h_spread": hs_u8,
+        "push": push_bit,
+        "decay": DEFAULT_VIBE_HALF_LIFE_MS,
+        "modality_when_fused": MODALITY_AUDIOVISUAL_TACTILE,
+        "physicality": interpret_tactile_physicality(qv_u8, hs_u8),
+    }
+
+
+def pack_vibration_packet_8bytes(pkt: Dict[str, Any]) -> bytes:
+    """
+    Packs a `VibrationPacket` into the exact Option B 8-byte binary layout (`>IHBB`):
+      - bytes 0..3 : `t`        (uint32 big-endian, timestamp ms)
+      - bytes 4..5 : `align_id` (uint16 big-endian, 100 ms window ID)
+      - byte  6    : `q_vibe`   (uint8: 0..255)
+      - byte  7    : `h_spread` (uint8: 0..255)
+    """
+    import struct
+
+    return struct.pack(
+        ">IHBB",
+        max(0, min(0xFFFFFFFF, int(pkt["t"]))),
+        max(0, min(0xFFFF, int(pkt["align_id"]))),
+        max(0, min(255, int(pkt["q_vibe"]))),
+        max(0, min(255, int(pkt["h_spread"]))),
+    )
+
+
+def unpack_vibration_packet_8bytes(
+    raw: bytes,
+    *,
+    push_threshold_vibe: int = DEFAULT_PUSH_THRESHOLD_VIBE,
+) -> Dict[str, Any]:
+    """Unpacks an 8-byte Option B `VibrationPacket` back into its canonical dict."""
+    import struct
+
+    if len(raw) != 8:
+        raise ValueError(f"Expected 8-byte vibration packet, got {len(raw)} bytes")
+    t_ms, align_id_u16, qv_u8, hs_u8 = struct.unpack(">IHBB", raw)
+    push_bit = 1 if int(qv_u8) >= int(push_threshold_vibe) else 0
+    return {
+        "t": int(t_ms),
+        "align_id": int(align_id_u16),
+        "q_vibe": int(qv_u8),
+        "h_spread": int(hs_u8),
+        "push": push_bit,
+        "decay": DEFAULT_VIBE_HALF_LIFE_MS,
+        "modality_when_fused": MODALITY_AUDIOVISUAL_TACTILE,
+        "physicality": interpret_tactile_physicality(int(qv_u8), int(hs_u8)),
+    }
+
+
+class HapticActuator:
+    """
+    External Haptic Actuator Subsystem with 6 Deterministic Safety Gates:
+      1. Consent Gate     : User must opt-in (`ERR_HAPTIC_CONSENT_REQUIRED` if not).
+      2. Rate Limiter     : Max 10 intensity changes/sec (prevents motor buzzing).
+      3. Intensity Cap    : Motor power <= 80% of max (`HAPTIC_INTENSITY_CAP = 0.80`).
+      4. Duration Limit   : Auto-stop after 30s (`30000 ms`) continuous vibration.
+      5. Kill Switch      : Immediate cutoff (`< 100 ms`, `motor_intensity = 0.0`).
+      6. Sub-Bass Floor   : 20 Hz minimum (`< 20 Hz` refused with `ERR_SUB_BASS_PROHIBITED`).
+    """
+
+    SUPPORTED_MOTOR_PROFILES = ("abstract", "ERM", "LRA", "voice_coil")
+
+    def __init__(
+        self,
+        *,
+        user_consented: bool = False,
+        intensity_cap: float = HAPTIC_INTENSITY_CAP,
+        max_changes_per_sec: int = HAPTIC_MAX_CHANGES_PER_SEC,
+        max_continuous_ms: int = HAPTIC_MAX_CONTINUOUS_MS,
+        motor_profile: str = "abstract",
+    ) -> None:
+        if motor_profile not in self.SUPPORTED_MOTOR_PROFILES:
+            raise ValueError(f"Unsupported motor_profile {motor_profile!r}")
+        self.user_consented = bool(user_consented)
+        self.intensity_cap = min(HAPTIC_INTENSITY_CAP, max(0.0, float(intensity_cap)))
+        self.max_changes_per_sec = max(1, int(max_changes_per_sec))
+        self.max_continuous_ms = max(1000, int(max_continuous_ms))
+        self.motor_profile = motor_profile
+
+        self._kill_switch_active: bool = False
+        self._kill_switch_triggered_t_ms: Optional[int] = None
+        self._change_timestamps_ms: List[int] = []
+        self._continuous_start_t_ms: Optional[int] = None
+        self._current_intensity: float = 0.0
+        self._current_pattern: str = "idle"
+        self._rate_limited_count: int = 0
+        self._auto_stopped_count: int = 0
+
+    def grant_consent(self, consented: bool = True) -> None:
+        self.user_consented = bool(consented)
+
+    def trigger_kill_switch(self, current_t_ms: int = 0) -> Dict[str, Any]:
+        """Immediate kill-switch cutoff (< 100 ms latency)."""
+        self._kill_switch_active = True
+        self._kill_switch_triggered_t_ms = int(current_t_ms)
+        self._current_intensity = 0.0
+        self._current_pattern = "killed"
+        self._continuous_start_t_ms = None
+        return {
+            "status": "killed",
+            "kill_switch_active": True,
+            "motor_intensity": 0.0,
+            "motor_pattern": "killed",
+            "cutoff_latency_ms": 0,
+            "within_100ms_slo": True,
+        }
+
+    def reset_kill_switch(self) -> None:
+        self._kill_switch_active = False
+        self._current_pattern = "idle"
+
+    def drive(
+        self,
+        *,
+        t_ms: int,
+        q_vibe: int,
+        h_spread: int,
+        freq_hz: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Drives the haptic actuator from `(q_vibe, h_spread)` after verifying all 6 safety gates.
+        """
+        # Gate 1: Consent
+        if not self.user_consented:
+            raise PermissionError(
+                "ERR_HAPTIC_CONSENT_REQUIRED: explicit user opt-in is required before driving haptic actuator"
+            )
+
+        # Gate 6: Sub-bass floor (20 Hz minimum)
+        if freq_hz is not None and float(freq_hz) < SUB_BASS_FLOOR_HZ:
+            raise ValueError(
+                f"ERR_SUB_BASS_PROHIBITED: infrasound frequency {freq_hz} Hz < {SUB_BASS_FLOOR_HZ} Hz is prohibited"
+            )
+
+        t_now = max(0, int(t_ms))
+
+        # Gate 5: Kill switch
+        if self._kill_switch_active:
+            self._current_intensity = 0.0
+            self._current_pattern = "killed"
+            return {
+                "status": "killed",
+                "t_ms": t_now,
+                "motor_intensity": 0.0,
+                "motor_pattern": "killed",
+                "rate_limited": False,
+                "auto_stopped_duration_limit": False,
+                "kill_switch_active": True,
+            }
+
+        qv = max(0, min(255, int(q_vibe)))
+        hs = max(0, min(255, int(h_spread)))
+
+        if qv == 0:
+            self._continuous_start_t_ms = None
+            self._current_intensity = 0.0
+            self._current_pattern = "idle"
+            return {
+                "status": "idle",
+                "t_ms": t_now,
+                "motor_intensity": 0.0,
+                "motor_pattern": "idle",
+                "rate_limited": False,
+                "auto_stopped_duration_limit": False,
+                "kill_switch_active": False,
+            }
+
+        # Gate 4: Duration limit (auto-stop after 30s continuous vibration)
+        if self._continuous_start_t_ms is None:
+            self._continuous_start_t_ms = t_now
+        continuous_elapsed_ms = max(0, t_now - self._continuous_start_t_ms)
+        if continuous_elapsed_ms >= self.max_continuous_ms:
+            self._auto_stopped_count += 1
+            self._current_intensity = 0.0
+            self._current_pattern = "auto_stopped"
+            return {
+                "status": "auto_stopped",
+                "t_ms": t_now,
+                "continuous_duration_ms": continuous_elapsed_ms,
+                "motor_intensity": 0.0,
+                "motor_pattern": "auto_stopped",
+                "rate_limited": False,
+                "auto_stopped_duration_limit": True,
+                "kill_switch_active": False,
+            }
+
+        # Gate 3: Intensity cap (<= 80% max)
+        desired_intensity = round((qv / 255.0) * self.intensity_cap, 6)
+        desired_intensity = min(HAPTIC_INTENSITY_CAP, max(0.0, desired_intensity))
+        desired_pattern = "wide_rumble" if hs > 128 else "focused_pulse"
+
+        # Gate 2: Rate limiter (max 10 intensity changes per 1000 ms sliding window)
+        self._change_timestamps_ms = [
+            ts for ts in self._change_timestamps_ms if (t_now - ts) < 1000
+        ]
+        intensity_changed = abs(desired_intensity - self._current_intensity) > 1e-6
+        rate_limited = False
+        if intensity_changed:
+            if len(self._change_timestamps_ms) >= self.max_changes_per_sec:
+                rate_limited = True
+                self._rate_limited_count += 1
+            else:
+                self._change_timestamps_ms.append(t_now)
+                self._current_intensity = desired_intensity
+                self._current_pattern = desired_pattern
+        else:
+            self._current_pattern = desired_pattern
+
+        return {
+            "status": "active",
+            "t_ms": t_now,
+            "q_vibe": qv,
+            "h_spread": hs,
+            "motor_profile": self.motor_profile,
+            "motor_intensity": self._current_intensity,
+            "motor_pattern": self._current_pattern,
+            "intensity_cap": self.intensity_cap,
+            "changes_in_last_1s": len(self._change_timestamps_ms),
+            "rate_limited": rate_limited,
+            "rate_limited_total_count": self._rate_limited_count,
+            "continuous_duration_ms": continuous_elapsed_ms,
+            "auto_stopped_duration_limit": False,
+            "kill_switch_active": False,
+        }
 
 
 def build_charge_packet(
@@ -2563,18 +3155,25 @@ def build_charge_packet(
     multimodal real-time fusion byte layouts:
       - `t`        : timestamp (ms)
       - `f_band`   : frequency band / pitch class / spatial region (0..255)
-      - `modality` : 0=vision, 1=audio, 2=fused
+      - `modality` : 0=vision, 1=audio, 2=fused, 3=audiovisual+tactile
       - `q_fast`   : fast-lane charge (0..255, ~20-50 ms transients/phonemes/motion)
       - `q_slow`   : slow-lane charge (0..255, ~1-8 s harmony/prosody/scene mood)
       - `q`        : peak active charge magnitude (0..255)
       - `lane`     : 0=fast, 1=slow, 2=dual
-      - `align_id` : integer window ID linking vision+audio within ~100 ms
+      - `align_id` : integer window ID linking vision+audio+vibration within ~100 ms
       - `push`     : 0/1 (crossed threshold into the agent's Electrical Area)
       - `revision` : 0/1 (updates/contradicts prior impression in Electrical Area)
       - `decay`    : half-life in ms
     """
-    if modality not in (MODALITY_VISION, MODALITY_AUDIO, MODALITY_FUSED):
-        raise ValueError(f"Invalid modality {modality}; must be 0 (vision), 1 (audio), or 2 (fused)")
+    if modality not in (
+        MODALITY_VISION,
+        MODALITY_AUDIO,
+        MODALITY_FUSED,
+        MODALITY_AUDIOVISUAL_TACTILE,
+    ):
+        raise ValueError(
+            f"Invalid modality {modality}; must be 0 (vision), 1 (audio), 2 (fused), or 3 (audiovisual+tactile)"
+        )
     t_ms = max(0, int(t))
     fb_u8 = max(0, min(255, int(f_band)))
     qf_u8 = max(0, min(255, int(q_fast)))
@@ -2766,27 +3365,40 @@ class AgentElectricalAreaBuffer:
         self,
         *,
         window_ms: int = DEFAULT_ELECTRICAL_AREA_WINDOW_MS,
+        vibe_window_ms: int = DEFAULT_VIBRATION_WINDOW_MS,
         align_window_ms: int = DEFAULT_ALIGN_WINDOW_MS,
         push_threshold_fast: int = 40,
         push_threshold_slow: int = 32,
+        push_threshold_vibe: int = DEFAULT_PUSH_THRESHOLD_VIBE,
         micro_cadence_ms: int = 500,
         macro_cadence_ms: int = 3000,
         revision_band_delta: int = 16,
         vision_cap: int = 255,
         audio_cap: int = 255,
+        max_total_buffer_packets: int = 100,
+        max_vibration_buffer_share: float = MAX_VIBRATION_BUFFER_SHARE,
     ) -> None:
         self.window_ms = max(500, int(window_ms))
+        self.vibe_window_ms = max(1000, int(vibe_window_ms))
         self.align_window_ms = max(10, int(align_window_ms))
         self.push_threshold_fast = int(push_threshold_fast)
         self.push_threshold_slow = int(push_threshold_slow)
+        self.push_threshold_vibe = int(push_threshold_vibe)
         self.micro_cadence_ms = max(100, int(micro_cadence_ms))
         self.macro_cadence_ms = max(500, int(macro_cadence_ms))
         self.revision_band_delta = max(1, int(revision_band_delta))
         self.vision_cap = max(1, min(255, int(vision_cap)))
         self.audio_cap = max(1, min(255, int(audio_cap)))
+        self.max_total_buffer_packets = max(10, int(max_total_buffer_packets))
+        self.max_vibration_buffer_share = max(0.05, min(0.30, float(max_vibration_buffer_share)))
+        self.vibration_budget_cap = max(
+            1, int(self.max_total_buffer_packets * self.max_vibration_buffer_share)
+        )
 
         self._active_area: List[Dict[str, Any]] = []
+        self._vibration_area: List[Dict[str, Any]] = []
         self._by_align_id: Dict[int, Dict[int, Dict[str, Any]]] = {}
+        self._vibe_by_align_id: Dict[int, Dict[str, Any]] = {}
         self._emitted_micro_align_ids: set[int] = set()
         self._micro_tokens: List[Dict[str, Any]] = []
         self._macro_tokens: List[Dict[str, Any]] = []
@@ -2795,6 +3407,8 @@ class AgentElectricalAreaBuffer:
         self._last_macro_t: int = -100000
         self._dominant_band_by_modality: Dict[int, int] = {}
         self._evicted_count: int = 0
+        self._vibe_evicted_count: int = 0
+        self._vibe_budget_evicted_count: int = 0
         self._dedup_skipped_count: int = 0
         self._latest_t_ms: int = 0
         self._cumulative_slow_vector: List[int] = [0] * 8
@@ -2816,6 +3430,127 @@ class AgentElectricalAreaBuffer:
             else:
                 self._evicted_count += 1
         self._active_area = surviving
+
+        surviving_vibe: List[Dict[str, Any]] = []
+        for v_entry in self._vibration_area:
+            dt = max(0, current_t_ms - int(v_entry["t"]))
+            if dt > self.vibe_window_ms:
+                self._vibe_evicted_count += 1
+                continue
+            hl = max(1, int(v_entry.get("decay", DEFAULT_VIBE_HALF_LIFE_MS)))
+            half_steps = min(8, dt // hl)
+            decayed_qv = int(v_entry["q_vibe"]) >> half_steps
+            v_entry["current_decayed_q_vibe"] = decayed_qv
+            if decayed_qv >= 4:
+                surviving_vibe.append(v_entry)
+            else:
+                self._vibe_evicted_count += 1
+        self._vibration_area = surviving_vibe
+
+    def _try_fuse_tactile_packet(
+        self,
+        align_id: int,
+        slot_map: Dict[int, Dict[str, Any]],
+        vibe_pkt: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Fuses audio/vision charge with a pushed-up `VibrationPacket` in the same
+        100 ms `align_id` window into a `modality=3` (`MODALITY_AUDIOVISUAL_TACTILE`)
+        fused packet.
+        """
+        if vibe_pkt.get("push", 0) != 1 or MODALITY_AUDIOVISUAL_TACTILE in slot_map:
+            return slot_map.get(MODALITY_AUDIOVISUAL_TACTILE)
+
+        base_pkt = (
+            slot_map.get(MODALITY_FUSED)
+            or slot_map.get(MODALITY_AUDIO)
+            or slot_map.get(MODALITY_VISION)
+        )
+        if base_pkt is None or base_pkt.get("push", 0) != 1:
+            return None
+
+        fused_tactile = build_charge_packet(
+            t=max(int(base_pkt["t"]), int(vibe_pkt["t"])),
+            modality=MODALITY_AUDIOVISUAL_TACTILE,
+            f_band=int(base_pkt["f_band"]),
+            q_fast=int(base_pkt["q_fast"]),
+            q_slow=max(int(base_pkt["q_slow"]), int(vibe_pkt["q_vibe"])),
+            push_threshold_fast=self.push_threshold_fast,
+            push_threshold_slow=self.push_threshold_slow,
+            revision=int(base_pkt["revision"]),
+            decay_half_life_ms=DEFAULT_VIBE_HALF_LIFE_MS,
+            align_window_ms=self.align_window_ms,
+        )
+        fused_tactile["current_decayed_q"] = fused_tactile["q"]
+        fused_tactile["q_vibe"] = int(vibe_pkt["q_vibe"])
+        fused_tactile["h_spread"] = int(vibe_pkt["h_spread"])
+        fused_tactile["physicality"] = vibe_pkt["physicality"]
+        fused_tactile["agent_description"] = (
+            "heavy_bass"
+            if vibe_pkt["physicality"]["regime"] == "heavy_physical_presence"
+            else vibe_pkt["physicality"]["regime"]
+        )
+        fused_tactile["sync_delta_ms"] = abs(int(base_pkt["t"]) - int(vibe_pkt["t"]))
+        fused_tactile["packed_16bytes_hex"] = pack_charge_packet_16bytes(fused_tactile).hex()
+        fused_tactile["packed_vibration_8bytes_hex"] = pack_vibration_packet_8bytes(vibe_pkt).hex()
+        slot_map[MODALITY_AUDIOVISUAL_TACTILE] = fused_tactile
+        self._active_area.append(fused_tactile)
+        return fused_tactile
+
+    def ingest_vibration_packet(
+        self,
+        *,
+        t_ms: int,
+        q_vibe: int,
+        h_spread: int,
+    ) -> Dict[str, Any]:
+        """
+        Ingests a parallel 8-byte Option B `VibrationPacket` into the Electrical Area:
+          - Enforces the 30% vibration budget (`self.vibration_budget_cap`) so
+            bass-heavy tracks never evict audio/visual charge packets.
+          - Fuses with same-`align_id` pushed-up audio/visual charge into
+            `modality=3` (`MODALITY_AUDIOVISUAL_TACTILE`).
+        """
+        t_cur = max(self._latest_t_ms, max(0, int(t_ms)))
+        self._latest_t_ms = t_cur
+        self._decay_and_evict(t_cur)
+
+        vpkt = build_vibration_packet(
+            t=t_cur,
+            q_vibe=q_vibe,
+            h_spread=h_spread,
+            push_threshold_vibe=self.push_threshold_vibe,
+            align_window_ms=self.align_window_ms,
+        )
+        vpkt["current_decayed_q_vibe"] = vpkt["q_vibe"]
+        vpkt["packed_8bytes_hex"] = pack_vibration_packet_8bytes(vpkt).hex()
+
+        align_id = compute_align_id(t_cur, self.align_window_ms)
+        self._vibe_by_align_id[align_id] = vpkt
+        slot_map = self._by_align_id.setdefault(align_id, {})
+
+        budget_evicted = False
+        fused_tactile: Optional[Dict[str, Any]] = None
+        if vpkt["push"] == 1:
+            # Enforce max 30% vibration budget cap in the Electrical Area
+            if len(self._vibration_area) >= self.vibration_budget_cap:
+                self._vibration_area.pop(0)
+                self._vibe_budget_evicted_count += 1
+                budget_evicted = True
+            self._vibration_area.append(vpkt)
+            fused_tactile = self._try_fuse_tactile_packet(align_id, slot_map, vpkt)
+            if fused_tactile is not None and self._micro_tokens and self._micro_tokens[-1]["align_id"] == align_id:
+                self._micro_tokens[-1]["modality"] = MODALITY_AUDIOVISUAL_TACTILE
+                self._micro_tokens[-1]["kind"] = "audiovisual_tactile_push"
+                self._micro_tokens[-1]["agent_description"] = fused_tactile["agent_description"]
+
+        return {
+            "ingested_vibration_packet": vpkt,
+            "pushed_into_vibration_area": bool(vpkt["push"] == 1),
+            "vibration_budget_evicted_oldest": budget_evicted,
+            "fused_tactile_packet": fused_tactile,
+            "electrical_area_status": self.snapshot(current_t_ms=t_cur),
+        }
 
     def ingest_sensory_packet(
         self,
@@ -2922,16 +3657,25 @@ class AgentElectricalAreaBuffer:
                 slot_map[MODALITY_FUSED] = fused_pkt
                 self._active_area.append(fused_pkt)
 
+            # Check if a vibration packet pushed up in the same 100 ms align_id window (modality=3 fusion)
+            vibe_pkt = self._vibe_by_align_id.get(align_id)
+            fused_tactile_pkt: Optional[Dict[str, Any]] = None
+            if vibe_pkt is not None and vibe_pkt.get("push", 0) == 1:
+                fused_tactile_pkt = self._try_fuse_tactile_packet(align_id, slot_map, vibe_pkt)
+
             # Real-time Micro-Token emission (fast lane, deduplicated by align_id)
-            target_for_micro = fused_pkt or pkt
+            target_for_micro = fused_tactile_pkt or fused_pkt or pkt
             if (
                 align_id not in self._emitted_micro_align_ids
                 and (
-                    fused_pkt is not None
+                    fused_tactile_pkt is not None
+                    or fused_pkt is not None
                     or (t_cur - self._last_micro_t >= self.micro_cadence_ms)
                 )
             ):
-                if fused_pkt is not None:
+                if fused_tactile_pkt is not None:
+                    kind_label = "audiovisual_tactile_push"
+                elif fused_pkt is not None:
                     kind_label = "audiovisual_coincident_push"
                 elif modality == MODALITY_VISION:
                     kind_label = "visual_only_push"
@@ -2947,15 +3691,22 @@ class AgentElectricalAreaBuffer:
                     "revision": target_for_micro["revision"],
                     "emission_latency_ms": 0,
                 }
+                if fused_tactile_pkt is not None:
+                    micro_tok["agent_description"] = fused_tactile_pkt.get("agent_description", "heavy_bass")
                 # Upgrade earlier unimodal micro token in same align_id if fused arrived within 100ms
                 self._emitted_micro_align_ids.add(align_id)
                 self._last_micro_t = t_cur
                 self._micro_tokens.append(micro_tok)
-            elif fused_pkt is not None and self._micro_tokens and self._micro_tokens[-1]["align_id"] == align_id:
-                # Upgrade the same-window micro-token in place to audiovisual_coincident_push
-                self._micro_tokens[-1]["modality"] = MODALITY_FUSED
-                self._micro_tokens[-1]["kind"] = "audiovisual_coincident_push"
-                self._micro_tokens[-1]["q_fast"] = fused_pkt["q_fast"]
+            elif (fused_tactile_pkt is not None or fused_pkt is not None) and self._micro_tokens and self._micro_tokens[-1]["align_id"] == align_id:
+                if fused_tactile_pkt is not None:
+                    self._micro_tokens[-1]["modality"] = MODALITY_AUDIOVISUAL_TACTILE
+                    self._micro_tokens[-1]["kind"] = "audiovisual_tactile_push"
+                    self._micro_tokens[-1]["q_fast"] = fused_tactile_pkt["q_fast"]
+                    self._micro_tokens[-1]["agent_description"] = fused_tactile_pkt.get("agent_description", "heavy_bass")
+                elif fused_pkt is not None:
+                    self._micro_tokens[-1]["modality"] = MODALITY_FUSED
+                    self._micro_tokens[-1]["kind"] = "audiovisual_coincident_push"
+                    self._micro_tokens[-1]["q_fast"] = fused_pkt["q_fast"]
 
             # Real-time Macro-Token emission (slow lane, every macro_cadence_ms)
             if t_cur - self._last_macro_t >= self.macro_cadence_ms:
@@ -2972,7 +3723,8 @@ class AgentElectricalAreaBuffer:
             "ingested_packet": pkt,
             "pushed_into_electrical_area": bool(pkt["push"] == 1),
             "dedup_skipped": False,
-            "fused_packet": fused_pkt,
+            "fused_packet": fused_pkt or slot_map.get(MODALITY_AUDIOVISUAL_TACTILE),
+            "fused_tactile_packet": slot_map.get(MODALITY_AUDIOVISUAL_TACTILE),
             "electrical_area_status": self.snapshot(current_t_ms=t_cur),
         }
 
@@ -2981,22 +3733,38 @@ class AgentElectricalAreaBuffer:
         t_now = self._latest_t_ms if current_t_ms is None else max(self._latest_t_ms, int(current_t_ms))
         self._decay_and_evict(t_now)
 
-        if not self._active_area:
+        if not self._active_area and not self._vibration_area:
             state_token = "unknown_low_charge"
         else:
             mods = {int(e["modality"]) for e in self._active_area}
-            if MODALITY_FUSED in mods or (MODALITY_VISION in mods and MODALITY_AUDIO in mods):
+            if MODALITY_AUDIOVISUAL_TACTILE in mods:
+                state_token = "audiovisual_tactile_coincident"
+            elif MODALITY_FUSED in mods or (MODALITY_VISION in mods and MODALITY_AUDIO in mods):
                 state_token = "audiovisual_coincident"
             elif MODALITY_VISION in mods:
                 state_token = "vision_only"
-            else:
+            elif MODALITY_AUDIO in mods:
                 state_token = "audio_only"
+            else:
+                state_token = "vibration_only"
+
+        latest_vibe = self._vibration_area[-1] if self._vibration_area else None
+        tactile_summary = (
+            latest_vibe["physicality"]
+            if latest_vibe is not None
+            else interpret_tactile_physicality(0, 0)
+        )
 
         return {
             "current_t_ms": t_now,
             "window_ms": self.window_ms,
+            "vibe_window_ms": self.vibe_window_ms,
             "electrical_area_state_token": state_token,
             "active_pushed_packet_count": len(self._active_area),
+            "active_vibration_packet_count": len(self._vibration_area),
+            "vibration_budget_cap": self.vibration_budget_cap,
+            "vibration_budget_evictions": self._vibe_budget_evicted_count,
+            "tactile_physicality": tactile_summary,
             "evicted_packet_count": self._evicted_count,
             "dedup_skipped_count": self._dedup_skipped_count,
             "micro_tokens": list(self._micro_tokens),
@@ -3110,6 +3878,345 @@ def run_realtime_fusion_test_plan() -> Dict[str, Any]:
             "no_slow": abl_no_slow,
             "no_fast": abl_no_fast,
         },
+    }
+    assert_no_raw_buffer_leakage(out)
+    return out
+
+
+OPEN_QUESTIONS_DESIGN_RESOLUTIONS: Dict[str, Any] = {
+    "stereo_vs_mono_panning": {
+        "v1_default": "mono_spectral_horizontal_spread",
+        "rationale": (
+            "v1 models horizontal spread along the frequency axis (lateral spectral leakage across "
+            "logarithmic bands 0..freq_bands-1). Stereo left/right panning is orthogonal (spatial azimuth) "
+            "and can be carried as an optional second axis without altering the 8-byte VibrationPacket."
+        ),
+    },
+    "haptic_hardware_target": {
+        "v1_default": "abstract",
+        "supported_profiles": list(HapticActuator.SUPPORTED_MOTOR_PROFILES),
+        "rationale": (
+            "HapticActuator defaults to hardware-abstract normalized intensity (0.0..0.80) and pattern "
+            "('wide_rumble' vs 'focused_pulse'), while supporting explicit ERM, LRA, and voice_coil profiles."
+        ),
+    },
+    "vibration_packet_versioning": {
+        "v1_default": "fixed_8byte_v1_no_header_overhead",
+        "wire_format": ">IHBB (t:uint32, align_id:uint16, q_vibe:uint8, h_spread:uint8)",
+        "rationale": (
+            "Keeping the 8-byte Option B packet headerless preserves exact 64-bit alignment and zero "
+            "redundancy alongside the 16-byte ChargePacket; version negotiation is handled at session init."
+        ),
+    },
+}
+
+
+def run_horizontal_charge_and_vibration_test_plan() -> Dict[str, Any]:
+    """
+    Executes the Extended Horizontal Charge & Vibration Test Plan (Tests E, F, G, H, I, J):
+      - Test E (Bass detection): Pure sine tones at 40, 80, 120, 250, 500, 1000, 4000 Hz.
+        Verifies `q_vibe` is high for <= 120 Hz and near-zero above, and `h_spread`
+        monotonically decreases as frequency increases.
+      - Test F (Vibration + charge fusion): Clip with bass drop (vision unchanged, audio loud bass).
+        Verifies 8-byte `VibrationPacket` pushes up independently, fuses with audio charge into
+        `modality=3` (`MODALITY_AUDIOVISUAL_TACTILE`), describes `"heavy_bass"` / `"heavy_physical_presence"`,
+        and enforces the 30% vibration buffer budget cap.
+      - Test G (Horizontal spread on harmonics): A-major chord (220, 277, 330 Hz) vs pure 220 Hz tone.
+        Verifies horizontal charge spreads across fundamentals into connected islands and
+        `op_horizontal_charge_spread_index_q16` is higher for the chord than the pure tone.
+      - Test H (Saturation under bass): Maxed-out bass clip (rave.dj style). Verifies `q_vibe`
+        saturates at 255 without overflow, `2x` refractory ticks clamp runaway bursts, and
+        `h_spread` does not bleed into high treble bands.
+      - Test I (Ablation): Removing `q_vibe` loses physicality; removing `h_spread` loses
+        wide-vs-focused distinction; removing horizontal spread shrinks connected island width.
+      - Test J (Haptic safety): Verifies consent gate (`ERR_HAPTIC_CONSENT_REQUIRED`), rate limiter
+        (<= 10 changes/s), intensity cap (<= 0.80), 30s continuous duration auto-stop, kill-switch
+        (< 100ms immediate cutoff), and < 20 Hz infrasound refusal (`ERR_SUB_BASS_PROHIBITED`).
+    """
+    ts, fb = 128, 32
+
+    # -------------------------------------------------------------------------
+    # Test E: Bass detection across 40, 80, 120, 250, 500, 1000, 4000 Hz
+    # -------------------------------------------------------------------------
+    test_e_freqs = [40.0, 80.0, 120.0, 250.0, 500.0, 1000.0, 4000.0]
+    test_e_results: Dict[int, Dict[str, int]] = {}
+    for f_hz in test_e_freqs:
+        specs, _ = translate_audio_to_chargeable_bytes(
+            [{"kind": "tone", "freq_hz": f_hz, "t0": 10, "t1": 30, "gain": 0.85}],
+            ts,
+            fb,
+        )
+        pot_b, nov_b = _compile_chargeable_byte_potentials(specs, ts, fb, enable_horizontal_spread=True)
+        sim_b = _simulate_causal_playhead_charging(pot_b, nov_b, ts, fb, playhead_slot=25)
+        ops_b = _run_10_audio_charge_operators(
+            pot_b,
+            sim_b["pushed_up_bytes"],
+            sim_b["fast_bytes"],
+            sim_b["slow_bytes"],
+            None,
+            ts,
+            fb,
+            playhead_slot=25,
+            vibe_slot_bytes=sim_b["vibe_slot_bytes"],
+            saturated_cell_count=sim_b["saturated_cell_count"],
+            refractory_clamped_count=sim_b["refractory_clamped_count"],
+            vibe_saturated_slot_count=sim_b["vibe_saturated_slot_count"],
+            vibe_refractory_clamped_count=sim_b["vibe_refractory_clamped_count"],
+        )
+        test_e_results[int(f_hz)] = {
+            "q_vibe": int(ops_b["op_bass_vibration_energy_u8"]),
+            "h_spread_q16": int(ops_b["op_horizontal_charge_spread_index_q16"]),
+            "h_spread_u8": int(ops_b["op_vibration_and_horizontal_profile"]["h_spread_u8"]),
+            "tactile_salience_q16": int(ops_b["op_tactile_salience_q16"]),
+        }
+
+    bass_high_ok = all(test_e_results[f]["q_vibe"] >= 140 for f in (40, 80, 120))
+    above_bass_zero_ok = all(test_e_results[f]["q_vibe"] == 0 for f in (250, 500, 1000, 4000))
+    spread_seq = [test_e_results[int(f)]["h_spread_q16"] for f in test_e_freqs]
+    spread_decreasing_ok = all(spread_seq[i] > spread_seq[i + 1] for i in range(len(spread_seq) - 1))
+    test_e_passed = bool(bass_high_ok and above_bass_zero_ok and spread_decreasing_ok)
+
+    # -------------------------------------------------------------------------
+    # Test F: Vibration + charge fusion (modality=3) & 30% vibration budget cap
+    # -------------------------------------------------------------------------
+    area_f = AgentElectricalAreaBuffer(
+        window_ms=3000,
+        vibe_window_ms=4000,
+        align_window_ms=100,
+        max_total_buffer_packets=20,
+        max_vibration_buffer_share=0.30,  # max 6 vibration packets
+    )
+    # Audio loud bass drop at t=320 ms (vision: nothing changes)
+    area_f.ingest_sensory_packet(t_ms=320, modality=MODALITY_AUDIO, f_band=2, q_fast=210, q_slow=185)
+    # Parallel 8-byte VibrationPacket in same 100 ms align_id=3 window
+    res_f_vibe = area_f.ingest_vibration_packet(t_ms=345, q_vibe=225, h_spread=165)
+    fused_f = res_f_vibe["fused_tactile_packet"]
+    snap_f = area_f.snapshot(current_t_ms=345)
+
+    # Verify 30% vibration budget cap: push 10 vibration packets and confirm active vibration count <= 6 (30% of 20)
+    for extra_i in range(10):
+        area_f.ingest_vibration_packet(t_ms=400 + extra_i * 100, q_vibe=190, h_spread=150)
+    snap_f_budget = area_f.snapshot(current_t_ms=1400)
+
+    test_f_passed = bool(
+        fused_f is not None
+        and fused_f["modality"] == MODALITY_AUDIOVISUAL_TACTILE
+        and fused_f["align_id"] == 3
+        and fused_f["agent_description"] == "heavy_bass"
+        and fused_f["physicality"]["regime"] == "heavy_physical_presence"
+        and snap_f["electrical_area_state_token"] == "audiovisual_tactile_coincident"
+        and snap_f_budget["active_vibration_packet_count"] <= snap_f_budget["vibration_budget_cap"]
+        and snap_f_budget["vibration_budget_evictions"] > 0
+    )
+
+    # -------------------------------------------------------------------------
+    # Test G: Horizontal spread on harmonics (A-major chord 220, 277, 330 Hz vs pure 220 Hz)
+    # -------------------------------------------------------------------------
+    specs_pure, _ = translate_audio_to_chargeable_bytes(
+        [{"kind": "tone", "freq_hz": 220.0, "t0": 10, "t1": 35, "gain": 0.85}],
+        ts,
+        fb,
+    )
+    pot_pure, nov_pure = _compile_chargeable_byte_potentials(specs_pure, ts, fb, enable_horizontal_spread=True)
+    sim_pure = _simulate_causal_playhead_charging(pot_pure, nov_pure, ts, fb, playhead_slot=30)
+    ops_pure = _run_10_audio_charge_operators(
+        pot_pure, sim_pure["pushed_up_bytes"], sim_pure["fast_bytes"], sim_pure["slow_bytes"],
+        None, ts, fb, playhead_slot=30, vibe_slot_bytes=sim_pure["vibe_slot_bytes"],
+    )
+
+    specs_chord, _ = translate_audio_to_chargeable_bytes(
+        [{"kind": "chord", "freq_hz": 220.0, "frequencies_hz": [220.0, 277.0, 330.0], "t0": 10, "t1": 35, "gain": 0.85}],
+        ts,
+        fb,
+    )
+    pot_chord, nov_chord = _compile_chargeable_byte_potentials(specs_chord, ts, fb, enable_horizontal_spread=True)
+    sim_chord = _simulate_causal_playhead_charging(pot_chord, nov_chord, ts, fb, playhead_slot=30)
+    ops_chord = _run_10_audio_charge_operators(
+        pot_chord, sim_chord["pushed_up_bytes"], sim_chord["fast_bytes"], sim_chord["slow_bytes"],
+        None, ts, fb, playhead_slot=30, vibe_slot_bytes=sim_chord["vibe_slot_bytes"],
+    )
+
+    pure_bbox = ops_pure["op_connected_charge_events_4c"]["foreground_bbox"]
+    chord_bbox = ops_chord["op_connected_charge_events_4c"]["foreground_bbox"]
+    pure_width = pure_bbox["b_max"] - pure_bbox["b_min"] + 1
+    chord_width = chord_bbox["b_max"] - chord_bbox["b_min"] + 1
+
+    test_g_passed = bool(
+        ops_chord["op_horizontal_charge_spread_index_q16"] > ops_pure["op_horizontal_charge_spread_index_q16"]
+        and chord_width > pure_width
+        and ops_chord["op_connected_charge_events_4c"]["component_count"] == 1
+    )
+
+    # -------------------------------------------------------------------------
+    # Test H: Saturation under maxed-out bass (rave.dj style)
+    # -------------------------------------------------------------------------
+    specs_rave, _ = translate_audio_to_chargeable_bytes(
+        [
+            {"kind": "chord", "freq_hz": 40.0, "frequencies_hz": [40.0, 80.0, 120.0], "t0": 5, "t1": 55, "gain": 1.0}
+        ],
+        ts,
+        fb,
+    )
+    pot_rave, nov_rave = _compile_chargeable_byte_potentials(specs_rave, ts, fb, enable_horizontal_spread=True)
+    sim_rave = _simulate_causal_playhead_charging(
+        pot_rave, nov_rave, ts, fb, playhead_slot=50, refractory_ticks=2
+    )
+    ops_rave = _run_10_audio_charge_operators(
+        pot_rave, sim_rave["pushed_up_bytes"], sim_rave["fast_bytes"], sim_rave["slow_bytes"],
+        None, ts, fb, playhead_slot=50, vibe_slot_bytes=sim_rave["vibe_slot_bytes"],
+        saturated_cell_count=sim_rave["saturated_cell_count"],
+        refractory_clamped_count=sim_rave["refractory_clamped_count"],
+        vibe_saturated_slot_count=sim_rave["vibe_saturated_slot_count"],
+        vibe_refractory_clamped_count=sim_rave["vibe_refractory_clamped_count"],
+    )
+    vibe_prof_rave = ops_rave["op_vibration_and_horizontal_profile"]
+    test_h_passed = bool(
+        ops_rave["op_bass_vibration_energy_u8"] == 255
+        and ops_rave["op_push_up_profile_q16"]["max_charge_u8"] <= 255
+        and vibe_prof_rave["vibe_refractory_clamped_count"] > 0
+        and vibe_prof_rave["high_band_bleed_sum"] == 0
+    )
+
+    # -------------------------------------------------------------------------
+    # Test I: Ablation (remove q_vibe, remove h_spread, remove horizontal spread)
+    # -------------------------------------------------------------------------
+    full_phys = interpret_tactile_physicality(q_vibe=220, h_spread=160)
+    no_qvibe_phys = interpret_tactile_physicality(q_vibe=0, h_spread=160)
+    no_hspread_phys = interpret_tactile_physicality(q_vibe=220, h_spread=0)
+
+    specs_bass_80, _ = translate_audio_to_chargeable_bytes(
+        [{"kind": "tone", "freq_hz": 80.0, "t0": 10, "t1": 30, "gain": 0.85}],
+        ts,
+        fb,
+    )
+    pot_with_spread, nov_with_spread = _compile_chargeable_byte_potentials(
+        specs_bass_80, ts, fb, enable_horizontal_spread=True
+    )
+    sim_with_spread = _simulate_causal_playhead_charging(pot_with_spread, nov_with_spread, ts, fb, playhead_slot=25)
+    ops_with_spread = _run_10_audio_charge_operators(
+        pot_with_spread, sim_with_spread["pushed_up_bytes"], sim_with_spread["fast_bytes"], sim_with_spread["slow_bytes"],
+        None, ts, fb, playhead_slot=25, vibe_slot_bytes=sim_with_spread["vibe_slot_bytes"],
+    )
+
+    pot_no_spread, nov_no_spread = _compile_chargeable_byte_potentials(
+        specs_bass_80, ts, fb, enable_horizontal_spread=False
+    )
+    sim_no_spread = _simulate_causal_playhead_charging(pot_no_spread, nov_no_spread, ts, fb, playhead_slot=25)
+    ops_no_spread = _run_10_audio_charge_operators(
+        pot_no_spread, sim_no_spread["pushed_up_bytes"], sim_no_spread["fast_bytes"], sim_no_spread["slow_bytes"],
+        None, ts, fb, playhead_slot=25, vibe_slot_bytes=sim_no_spread["vibe_slot_bytes"],
+    )
+
+    bbox_with = ops_with_spread["op_connected_charge_events_4c"]["foreground_bbox"]
+    bbox_without = ops_no_spread["op_connected_charge_events_4c"]["foreground_bbox"]
+    width_with = bbox_with["b_max"] - bbox_with["b_min"] + 1
+    width_without = bbox_without["b_max"] - bbox_without["b_min"] + 1
+
+    test_i_passed = bool(
+        full_phys["regime"] == "heavy_physical_presence"
+        and no_qvibe_phys["regime"] != "heavy_physical_presence"
+        and no_qvibe_phys["q_vibe_level"] == "low"
+        and no_hspread_phys["regime"] == "focused_low_tone"
+        and no_hspread_phys["tactile_salience_q16"] == 0
+        and width_with > width_without
+        and ops_with_spread["op_horizontal_charge_spread_index_q16"] > ops_no_spread["op_horizontal_charge_spread_index_q16"]
+    )
+
+    # -------------------------------------------------------------------------
+    # Test J: Haptic safety (consent, rate limiter, intensity cap, 30s duration, kill switch, <20Hz refusal)
+    # -------------------------------------------------------------------------
+    actuator = HapticActuator(user_consented=False)
+    consent_blocked = False
+    try:
+        actuator.drive(t_ms=0, q_vibe=200, h_spread=150, freq_hz=60.0)
+    except PermissionError as exc:
+        consent_blocked = "ERR_HAPTIC_CONSENT_REQUIRED" in str(exc)
+
+    actuator.grant_consent(True)
+
+    # Sub-bass (< 20 Hz) refusal check on both actuator and audio translator
+    sub_bass_actuator_refused = False
+    try:
+        actuator.drive(t_ms=10, q_vibe=200, h_spread=150, freq_hz=14.0)
+    except ValueError as exc:
+        sub_bass_actuator_refused = "ERR_SUB_BASS_PROHIBITED" in str(exc)
+
+    sub_bass_translator_refused = False
+    try:
+        translate_audio_to_chargeable_bytes(
+            [{"kind": "tone", "freq_hz": 15.0, "t0": 0, "t1": 10, "gain": 0.8}], ts, fb
+        )
+    except ValueError as exc:
+        sub_bass_translator_refused = "ERR_SUB_BASS_PROHIBITED" in str(exc)
+
+    # Intensity cap (<= 0.80 at q_vibe=255) + rate limiter (max 10 changes/s)
+    rate_limit_triggered = False
+    max_intensity_seen = 0.0
+    for step_i in range(14):
+        qv_step = min(255, 40 + step_i * 15)
+        drv = actuator.drive(t_ms=100 + step_i * 50, q_vibe=qv_step, h_spread=160, freq_hz=60.0)
+        if drv["motor_intensity"] > max_intensity_seen:
+            max_intensity_seen = drv["motor_intensity"]
+        if drv["rate_limited"]:
+            rate_limit_triggered = True
+
+    # Duration limit: auto-stop after 30s (30000 ms) continuous vibration
+    drv_30s = actuator.drive(t_ms=30200, q_vibe=255, h_spread=160, freq_hz=60.0)
+    duration_auto_stopped = bool(
+        drv_30s["auto_stopped_duration_limit"] is True and drv_30s["motor_intensity"] == 0.0
+    )
+
+    # Kill switch immediate cutoff (< 100 ms)
+    kill_res = actuator.trigger_kill_switch(current_t_ms=30250)
+    drv_after_kill = actuator.drive(t_ms=30300, q_vibe=255, h_spread=180, freq_hz=60.0)
+    kill_switch_ok = bool(
+        kill_res["within_100ms_slo"] is True
+        and kill_res["motor_intensity"] == 0.0
+        and drv_after_kill["status"] == "killed"
+        and drv_after_kill["motor_intensity"] == 0.0
+    )
+
+    test_j_passed = bool(
+        consent_blocked
+        and sub_bass_actuator_refused
+        and sub_bass_translator_refused
+        and rate_limit_triggered
+        and max_intensity_seen <= HAPTIC_INTENSITY_CAP
+        and duration_auto_stopped
+        and kill_switch_ok
+    )
+
+    all_passed = bool(
+        test_e_passed
+        and test_f_passed
+        and test_g_passed
+        and test_h_passed
+        and test_i_passed
+        and test_j_passed
+    )
+    out = {
+        "all_passed": all_passed,
+        "test_e_bass_detection_passed": test_e_passed,
+        "test_f_vibration_charge_fusion_passed": test_f_passed,
+        "test_g_horizontal_spread_harmonics_passed": test_g_passed,
+        "test_h_saturation_under_bass_passed": test_h_passed,
+        "test_i_ablation_passed": test_i_passed,
+        "test_j_haptic_safety_passed": test_j_passed,
+        "test_e_frequency_sweep": test_e_results,
+        "test_g_chord_vs_pure_tone": {
+            "pure_220hz_h_spread_q16": ops_pure["op_horizontal_charge_spread_index_q16"],
+            "chord_a_major_h_spread_q16": ops_chord["op_horizontal_charge_spread_index_q16"],
+            "pure_220hz_island_width_bands": pure_width,
+            "chord_a_major_island_width_bands": chord_width,
+        },
+        "test_i_ablation_summary": {
+            "with_horizontal_spread_island_width_bands": width_with,
+            "without_horizontal_spread_island_width_bands": width_without,
+            "full_physicality_regime": full_phys["regime"],
+            "no_q_vibe_regime": no_qvibe_phys["regime"],
+            "no_h_spread_regime": no_hspread_phys["regime"],
+        },
+        "open_questions_resolutions": OPEN_QUESTIONS_DESIGN_RESOLUTIONS,
     }
     assert_no_raw_buffer_leakage(out)
     return out

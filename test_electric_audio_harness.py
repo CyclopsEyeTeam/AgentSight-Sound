@@ -14,6 +14,7 @@ import unittest
 
 from electric_audio_agent_bridge import (
     MODALITY_AUDIO,
+    MODALITY_AUDIOVISUAL_TACTILE,
     MODALITY_FUSED,
     MODALITY_VISION,
     SEMANTIC_BOUNDARY_CONTRACT,
@@ -21,16 +22,25 @@ from electric_audio_agent_bridge import (
     AgentNarrationStateMachine,
     ElectricAudioAgentSession,
     ElectricSightAndSoundSession,
+    HapticActuator,
     ablate_charge_lanes,
+    apply_horizontal_spread,
     build_charge_packet,
+    build_vibration_packet,
     calibrate_adaptive_charge_thresholds,
+    compute_q_vibe,
     create_agent_interpretation_envelope,
+    default_band_spread_factors,
     explain_charge_push_up_trace,
+    interpret_tactile_physicality,
     pack_charge_packet_16bytes,
+    pack_vibration_packet_8bytes,
+    run_horizontal_charge_and_vibration_test_plan,
     run_realtime_fusion_test_plan,
     run_tier2_fidelity_adversarial_and_edge_profile,
     tone_alphabet_text_to_events,
     unpack_charge_packet_16bytes,
+    unpack_vibration_packet_8bytes,
     validate_and_translate_consented_pcm_samples,
 )
 from electric_audio_cli import run_cli
@@ -423,6 +433,48 @@ class TestElectricAudioAndSightSoundHarness(unittest.TestCase):
         )
         self.assertEqual(short["dynamic_and_tempo_profile"]["estimated_bpm"], 0)
         self.assertEqual(short["dynamic_and_tempo_profile"]["tempo_confidence_q16"], 0)
+
+    def test_horizontal_charge_spread_vibration_packet_and_haptic_safety_tests_e_to_j(self) -> None:
+        # 1. Option B 8-byte VibrationPacket binary layout (>IHBB) roundtrip
+        vpkt = build_vibration_packet(t=450, q_vibe=210, h_spread=175)
+        raw8 = pack_vibration_packet_8bytes(vpkt)
+        self.assertEqual(len(raw8), 8)
+        unpacked8 = unpack_vibration_packet_8bytes(raw8)
+        self.assertEqual(unpacked8["t"], 450)
+        self.assertEqual(unpacked8["align_id"], 4)
+        self.assertEqual(unpacked8["q_vibe"], 210)
+        self.assertEqual(unpacked8["h_spread"], 175)
+        self.assertEqual(unpacked8["push"], 1)
+        self.assertEqual(unpacked8["modality_when_fused"], MODALITY_AUDIOVISUAL_TACTILE)
+
+        # 2. Horizontal Charge Spread (spectral lateral leakage)
+        factors32 = default_band_spread_factors(32)
+        self.assertEqual(len(factors32), 32)
+        self.assertGreaterEqual(factors32[0], 0.40)
+        self.assertLessEqual(factors32[0], 0.50)
+        self.assertLessEqual(factors32[-1], 0.10)
+        row = [0] * 32
+        row[2] = 200
+        spread_row = apply_horizontal_spread(row, factors32)
+        self.assertGreater(spread_row[1], 0)
+        self.assertGreater(spread_row[3], 0)
+
+        # 3. Internal Tactile Physicality 4-quadrant interpreter
+        self.assertEqual(interpret_tactile_physicality(200, 160)["regime"], "heavy_physical_presence")
+        self.assertEqual(interpret_tactile_physicality(200, 30)["regime"], "focused_low_tone")
+        self.assertEqual(interpret_tactile_physicality(20, 160)["regime"], "wide_ambient_rumble")
+        self.assertEqual(interpret_tactile_physicality(5, 10)["regime"], "no_tactile_content")
+
+        # 4. Run full Extended Test Plan (Tests E, F, G, H, I, J)
+        hv_plan = run_horizontal_charge_and_vibration_test_plan()
+        self.assertTrue(hv_plan["all_passed"], hv_plan)
+        self.assertTrue(hv_plan["test_e_bass_detection_passed"])
+        self.assertTrue(hv_plan["test_f_vibration_charge_fusion_passed"])
+        self.assertTrue(hv_plan["test_g_horizontal_spread_harmonics_passed"])
+        self.assertTrue(hv_plan["test_h_saturation_under_bass_passed"])
+        self.assertTrue(hv_plan["test_i_ablation_passed"])
+        self.assertTrue(hv_plan["test_j_haptic_safety_passed"])
+        assert_no_raw_buffer_leakage(hv_plan)
 
 
 if __name__ == "__main__":

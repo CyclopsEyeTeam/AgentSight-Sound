@@ -27,9 +27,11 @@ from electric_audio_agent_bridge import (
     AgentElectricalAreaBuffer,
     AgentNarrationStateMachine,
     ElectricSightAndSoundSession,
+    HapticActuator,
     create_agent_interpretation_envelope,
     explain_charge_push_up_trace,
     pack_charge_packet_16bytes,
+    pack_vibration_packet_8bytes,
     validate_and_translate_consented_pcm_samples,
 )
 
@@ -107,6 +109,17 @@ def main() -> None:
     print(f"  16-Byte Wire Packet: {raw_16b.hex()} ({len(raw_16b)} bytes, modality={fused_pkt['modality']} FUSED)")
     print(f"  Coalesced Utterance: {json.dumps(utterance, sort_keys=True)}")
     print(f"  Boundary Contract  : {SEMANTIC_BOUNDARY_CONTRACT['contract_id']} (is_enclave_truth={interp_envelope['is_enclave_truth']})")
+
+    print("\n=== 4. Horizontal Charge Spread + 8-Byte VibrationPacket (Option B) + HapticActuator ===")
+    res_vibe = area.ingest_vibration_packet(t_ms=265, q_vibe=220, h_spread=168)
+    vpkt = res_vibe["ingested_vibration_packet"]
+    fused_tactile = res_vibe["fused_tactile_packet"]
+    raw_8b = pack_vibration_packet_8bytes(vpkt)
+    actuator = HapticActuator(user_consented=True)
+    haptic_out = actuator.drive(t_ms=265, q_vibe=vpkt["q_vibe"], h_spread=vpkt["h_spread"], freq_hz=60.0)
+    print(f"  8-Byte Vibe Packet : {raw_8b.hex()} ({len(raw_8b)} bytes, align_id={vpkt['align_id']}, q_vibe={vpkt['q_vibe']}, h_spread={vpkt['h_spread']})")
+    print(f"  Modality=3 Fusion  : modality={fused_tactile['modality']} ({fused_tactile['agent_description']} / {fused_tactile['physicality']['regime']})")
+    print(f"  Haptic Actuator    : intensity={haptic_out['motor_intensity']} (cap={haptic_out['intensity_cap']}), pattern={haptic_out['motor_pattern']}")
 
 
 if __name__ == "__main__":
