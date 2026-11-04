@@ -150,12 +150,23 @@ class TestElectricAudioAndSightSoundHarness(unittest.TestCase):
             )
             self.assertEqual(ok_reg["origin_attestation"], "owner_supplied_audio")
 
+            # companion_system_audio (on the owner's word, 2026-11-04) is accepted
+            ok_comp = session.register_chargeable_audio(
+                "src_supplied_aud",
+                "v2",
+                events,
+                time_slots=128,
+                freq_bands=32,
+                origin_attestation="companion_system_audio",
+            )
+            self.assertEqual(ok_comp["origin_attestation"], "companion_system_audio")
+
             # Live microphone capture is deterministically refused
             for bad_origin in ("live_microphone_capture", "system_loopback_stream", "untrusted_stream"):
                 with self.assertRaisesRegex(PermissionError, "ERR_NON_SYNTHETIC_AUDIO_PROHIBITED"):
                     session.register_chargeable_audio(
                         "src_supplied_aud",
-                        "v2",
+                        "v3",
                         events,
                         time_slots=128,
                         freq_bands=32,
@@ -344,6 +355,24 @@ class TestElectricAudioAndSightSoundHarness(unittest.TestCase):
                 origin_attestation="owner_supplied_audio",
                 consent_token=None,
             )
+        with self.assertRaisesRegex(PermissionError, "ERR_MISSING_AUDIO_CONSENT_TOKEN"):
+            validate_and_translate_consented_pcm_samples(
+                [1000, -1000] * 100,
+                sample_rate_hz=16000,
+                origin_attestation="companion_system_audio",
+                consent_token=None,
+            )
+        comp_pcm = validate_and_translate_consented_pcm_samples(
+            [1000, -1000] * 100,
+            sample_rate_hz=16000,
+            origin_attestation="companion_system_audio",
+            consent_token={
+                "consented": True,
+                "token_id": "tok_companion_ear",
+                "scope": "Companion listening to system audio, measurements only, never saved",
+            },
+        )
+        self.assertEqual(comp_pcm["origin_attestation"], "companion_system_audio")
 
         # Point C: Explainable charge trace & adaptive threshold calibration
         trace = explain_charge_push_up_trace(

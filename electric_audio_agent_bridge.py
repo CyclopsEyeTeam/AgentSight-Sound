@@ -16,8 +16,10 @@ Architecture (5-Layer Epistemic Stack + Second-Opinion Safeguards):
      Musical Time V3 note events, or owner-supplied PCM waveforms into an
      immutable, content-addressed (`SHA-256`) 2D Chargeable-Byte Matrix
      (`time_slots x freq_bands`, `uint8` `0..255`).
-   - Enforces non-live provenance (`synthetic_fixture` or `owner_supplied_audio`;
-     live microphone capture `live_microphone_capture` is deterministically
+   - Enforces non-live provenance (`synthetic_fixture` or `owner_supplied_audio`),
+     or, on the owner's word (2026-11-04), `"companion_system_audio"` for the
+     Companion's own in-memory listen to the system audio monitor (never saved,
+     never the microphone; `live_microphone_capture` is deterministically
      refused with `ERR_NON_SYNTHETIC_AUDIO_PROHIBITED`).
    - Lexical closure isolation: raw PCM waveform bytes and raw chargeable-byte
      arrays never leave the private closure vault (`0` raw audio or byte buffer
@@ -98,6 +100,7 @@ SUPPORTED_AUDIO_GRIDS: Tuple[Tuple[int, int], ...] = (
 VALID_AUDIO_ORIGINS = frozenset({
     "synthetic_fixture",
     "owner_supplied_audio",
+    "companion_system_audio",
 })
 
 AUDIO_EVENT_KINDS = frozenset({
@@ -1783,17 +1786,18 @@ class ElectricAudioAgentSession:
         v_sess = self.vision_session
         harness = v_sess._require_active()
 
-        # Enforce audio origin attestation firewall (synthetic_fixture or owner_supplied_audio)
+        # Enforce audio origin attestation firewall (synthetic_fixture, owner_supplied_audio, or companion_system_audio)
         if origin_attestation not in VALID_AUDIO_ORIGINS:
             raise PermissionError(
                 f"ERR_NON_SYNTHETIC_AUDIO_PROHIBITED: origin_attestation={origin_attestation!r} "
                 "is refused (live microphone capture and untrusted audio streams are prohibited)"
             )
-        harness_origin = (
-            "owner_supplied_picture"
-            if origin_attestation == "owner_supplied_audio"
-            else "synthetic_fixture"
-        )
+        if origin_attestation == "owner_supplied_audio":
+            harness_origin = "owner_supplied_picture"
+        elif origin_attestation == "companion_system_audio":
+            harness_origin = "companion_desktop_glance"
+        else:
+            harness_origin = "synthetic_fixture"
 
         ts = time_slots if time_slots is not None else self.default_grid[0]
         fb = freq_bands if freq_bands is not None else self.default_grid[1]
@@ -4542,8 +4546,8 @@ def validate_and_translate_consented_pcm_samples(
     """
     Tier-2 Consented Sandboxed Audio Validator & Multi-Band / Vocal-Sub-Lane
     (`300-3400 Hz`) Chargeable-Byte Translator:
-      1. Enforces `origin_attestation in ("synthetic_fixture", "owner_supplied_audio")`
-         and requires a non-expired `consent_token` when `origin_attestation == "owner_supplied_audio"`.
+      1. Enforces `origin_attestation in ("synthetic_fixture", "owner_supplied_audio", "companion_system_audio")`
+         and requires a non-expired `consent_token` when `origin_attestation in ("owner_supplied_audio", "companion_system_audio")`.
       2. Guards against adversarial audio:
          - Removes DC offset (`mean_i16`) before energy extraction.
          - Detects and clamps hard full-scale clipping (`|sample| >= 32760`).
@@ -4556,10 +4560,10 @@ def validate_and_translate_consented_pcm_samples(
     """
     if origin_attestation not in VALID_AUDIO_ORIGINS:
         raise PermissionError(f"ERR_NON_SYNTHETIC_AUDIO_PROHIBITED: {origin_attestation!r}")
-    if origin_attestation == "owner_supplied_audio":
+    if origin_attestation in ("owner_supplied_audio", "companion_system_audio"):
         if not isinstance(consent_token, dict) or not consent_token.get("consented"):
             raise PermissionError(
-                "ERR_MISSING_AUDIO_CONSENT_TOKEN: Tier-2 owner_supplied_audio requires an explicit consent_token"
+                f"ERR_MISSING_AUDIO_CONSENT_TOKEN: Tier-2 {origin_attestation} requires an explicit consent_token"
             )
     if not (8000 <= int(sample_rate_hz) <= 48000):
         raise ValueError(f"Unsupported sample_rate_hz {sample_rate_hz}; must be in 8000..48000")

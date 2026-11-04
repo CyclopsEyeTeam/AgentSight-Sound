@@ -32,6 +32,7 @@ HARD BOUNDARIES:
 
 from __future__ import annotations
 
+from ev_child_guard import die_with_parent
 import copy
 from datetime import datetime, timezone
 import hashlib
@@ -131,6 +132,7 @@ ALLOWED_VAULT_RPC_METHODS = frozenset({
     "issue_observation_receipt",
     "verify_observation_receipt",
     "emergency_lock_vault",
+    "evict_sources",
     "shutdown",
 })
 
@@ -147,6 +149,7 @@ def _vault_gate_daemon_loop(
     Runs exclusively in the child OS process for EXEC-GATE-1.
     Raw RGBA pixel buffers and the 32-byte HMAC signing key live ONLY inside this process.
     """
+    die_with_parent()
     if initial_key_bytes is not None:
         secret_key = initial_key_bytes
     else:
@@ -168,6 +171,7 @@ def _vault_gate_daemon_loop(
         sign_receipt,
         verify_receipt_sig,
         get_raster_cache_size,
+        evict_surfaces,
     ) = _create_isolated_vault_and_gate(
         profile="controlled_pilot_simulation",
         hmac_key_provider=lambda: secret_key,
@@ -352,6 +356,15 @@ def _vault_gate_daemon_loop(
                             "plane": plane,
                         }
                         _send_framed_json(conn, {"status": "ok", "result": {"content_sha256": digest}})
+
+                    elif method == "evict_sources":
+                        keys = [(str(k[0]), str(k[1])) for k in params.get("sources", [])][:4096]
+                        dropped = evict_surfaces(keys)
+                        for key in keys:
+                            source_registry.pop(key, None)
+                        for cc_key in [k for k in cc_cache if (k[0], k[1]) in set(keys)]:
+                            cc_cache.pop(cc_key, None)
+                        _send_framed_json(conn, {"status": "ok", "result": {"evicted": dropped}})
 
                     elif method == "store_ghost_pixels":
                         rid = params["render_id"]
@@ -968,6 +981,10 @@ class OutOfProcessVaultGateClient:
         )
         return res["content_sha256"]
 
+    def evict_sources(self, source_keys: Sequence[Sequence[str]]) -> int:
+        res = self._call("evict_sources", {"sources": [[str(k[0]), str(k[1])] for k in source_keys]})
+        return int(res["evicted"])
+
     def store_ghost_pixels(
         self,
         render_id: str,
@@ -1165,6 +1182,7 @@ def _audit_sink_daemon_loop(
     allowed_gid: int,
     ready_event: Any,
 ) -> None:
+    die_with_parent()
     checkpoint_signing_key = secrets.token_bytes(32)
     entries: List[Dict[str, Any]] = []
     fsync_count = 0
@@ -1572,6 +1590,7 @@ def _quarantine_and_kill_switch_daemon_loop(
     allowed_gid: int,
     ready_event: Any,
 ) -> None:
+    die_with_parent()
     kill_switches_state: Dict[str, Dict[str, Any]] = {
         ks_id: {
             **meta,
@@ -1758,8 +1777,10 @@ def _quarantine_and_kill_switch_daemon_loop(
                         origin = params.get("origin_attestation", "synthetic_fixture")
 
                         # 1. Enforce synthetic-only input policy; and, on the owner's word (2026-10-30), a picture the owner
-                        #    sent to remake or enhance, said honestly as such. Live capture stays refused.
-                        if origin not in ("synthetic_fixture", "owner_supplied_picture"):
+                        #    sent to remake or enhance, said honestly as such. And, on the owner's word (2026-11-04), the
+                        #    companion's own desktop glance (frames held in memory only, never saved). All other live
+                        #    capture stays refused.
+                        if origin not in ("synthetic_fixture", "owner_supplied_picture", "companion_desktop_glance"):
                             quarantine_rejected_count += 1
                             raise PermissionError(
                                 f"ERR_NON_SYNTHETIC_INPUT_PROHIBITED: origin_attestation='{origin}' rejected by zero-PII quarantine."

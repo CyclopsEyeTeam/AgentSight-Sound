@@ -640,6 +640,17 @@ def _create_isolated_vault_and_gate(
     def get_raster_cache_size() -> int:
         return len(raster_cache)
 
+    def evict_surfaces(source_keys: Sequence[Sequence[str]], render_ids: Sequence[str] = ()) -> int:
+        """Drops stored proxy surfaces the caller no longer serves; their descriptors stay immutable."""
+        dropped = 0
+        for key in source_keys:
+            if surfaces.pop((str(key[0]), str(key[1])), None) is not None:
+                dropped += 1
+        for render_id in render_ids:
+            if ghost_surfaces.pop(str(render_id), None) is not None:
+                dropped += 1
+        return dropped
+
     return (
         store_verified_source,
         store_ghost_render_pixels,
@@ -649,6 +660,7 @@ def _create_isolated_vault_and_gate(
         sign_receipt,
         verify_receipt_sig,
         get_raster_cache_size,
+        evict_surfaces,
     )
 
 
@@ -930,6 +942,7 @@ class ElectricEyeFixtureHarness:
                 self._sign_receipt,
                 self._verify_receipt_sig,
                 self._get_raster_cache_size,
+                self._evict_surfaces,
             ) = _create_isolated_vault_and_gate(
                 profile=profile,
                 hmac_key_provider=hmac_key_provider,
@@ -1129,6 +1142,18 @@ class ElectricEyeFixtureHarness:
         out = desc.to_dict()
         assert_no_raw_buffer_leakage(out)
         return out
+
+    def release_source_pixels(self, source_keys: Sequence[Tuple[str, str]]) -> int:
+        """
+        Frees the stored 128x128 pixels of sources the caller has retired. Their descriptors stay
+        registered, so a retired source_id@source_version can never be reused for other pixels.
+        """
+        keys = [[sid, sver] for sid, sver in source_keys]
+        if not keys:
+            return 0
+        if self._out_of_process_vault_client is not None:
+            return int(self._out_of_process_vault_client.evict_sources(keys))
+        return int(self._evict_surfaces(keys))
 
     def mutate_canvas(
         self,

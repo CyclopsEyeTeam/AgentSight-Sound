@@ -1133,8 +1133,10 @@ class TestElectricEyeFixtureHarness(unittest.TestCase):
             assert_no_raw_buffer_leakage(t6)
 
     def test_owner_supplied_picture_is_accepted_and_live_capture_still_refused(self) -> None:
-        """On the owner's word (2026-10-30): a picture the owner sends to remake or enhance is accepted under the honest origin
-        'owner_supplied_picture'; every other non-synthetic origin, live capture above all, stays refused."""
+        """On the owner's word (2026-10-30 & 2026-11-04): a picture the owner sends to remake or enhance is accepted under the
+        honest origin 'owner_supplied_picture', and the Companion's own desktop glance is accepted under
+        'companion_desktop_glance' (including via ContinuousElectricEyeStream.ingest_frame(origin_attestation=...));
+        every other non-synthetic origin, live webcam or generic screen capture above all, stays refused."""
         import shutil
         import tempfile
         from electric_vision_agent_bridge import ElectricVisionAgentSession
@@ -1145,7 +1147,20 @@ class TestElectricEyeFixtureHarness(unittest.TestCase):
             accepted = session.register_synthetic_canvas("src_gate_one", "v1", marks, width=512, height=512,
                                                          source_kind="image_bytes", origin_attestation="owner_supplied_picture")
             self.assertEqual(accepted["origin_attestation"], "owner_supplied_picture")
-            for n, origin in enumerate(("live_webcam_capture", "screen_capture", "anything_else"), 2):
+            glance_ok = session.register_synthetic_canvas("src_gate_one", "v2", marks, width=512, height=512,
+                                                          source_kind="image_bytes", origin_attestation="companion_desktop_glance")
+            self.assertEqual(glance_ok["origin_attestation"], "companion_desktop_glance")
+            stream = session.create_continuous_stream("src_companion_glance", width=128, height=128, max_window_frames=4)
+            rgba_128 = bytes([20, 60, 30, 255]) * (128 * 128)
+            ingested = stream.ingest_frame(
+                "v1",
+                [],
+                rgba=rgba_128,
+                origin={"kind": "companion_desktop_glance"},
+                origin_attestation="companion_desktop_glance",
+            )
+            self.assertEqual(ingested["tick"], 1)
+            for n, origin in enumerate(("live_webcam_capture", "live_screen_capture", "screen_capture", "anything_else"), 3):
                 with self.subTest(origin=origin), self.assertRaisesRegex(PermissionError, "ERR_NON_SYNTHETIC_INPUT_PROHIBITED"):
                     session.register_synthetic_canvas("src_gate_one", f"v{n}", marks, width=512, height=512, origin_attestation=origin)
 

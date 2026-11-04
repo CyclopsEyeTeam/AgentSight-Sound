@@ -194,6 +194,41 @@ def _validate_mark_hygiene(mark_dict: Dict[str, Any]) -> None:
         raise ValueError("ERR_TEXT_MARK_PROHIBITED: text marks are excluded from zero-PII synthetic vision")
 
 
+MIRROR_MODES = frozenset({"none", "x", "y", "xy"})
+# Older tool descriptions advertised h/v/hv; they mean the same reflections.
+MIRROR_ALIASES = {"h": "x", "v": "y", "hv": "xy", "vh": "xy", "yx": "xy"}
+MAX_MARK_COORDINATE = 2**53  # JSON-safe integers; geometry clips far values, so only non-finite ones are fatal
+MAX_LIST_ITEMS_PER_MARK = 4096
+
+
+def _validate_mark_numbers(value: Any, where: str, depth: int = 0) -> None:
+    """Rejects non-finite or absurd numbers and oversized point lists before any geometry runs."""
+    if depth > 8:
+        raise ValueError(f"ERR_MARK_TOO_DEEP: {where} is nested too deeply")
+    if isinstance(value, bool) or value is None:
+        return
+    if isinstance(value, (int, float)):
+        if not math.isfinite(value) or abs(value) > MAX_MARK_COORDINATE:
+            raise ValueError(f"ERR_MARK_NUMBER_OUT_OF_RANGE: {where} has {value!r}; numbers must be finite and within ±{MAX_MARK_COORDINATE}")
+        return
+    if isinstance(value, str):
+        try:
+            number = float(value)
+        except ValueError:
+            return
+        _validate_mark_numbers(number, where, depth + 1)
+        return
+    if isinstance(value, dict):
+        for key, inner in value.items():
+            _validate_mark_numbers(inner, f"{where}.{key}", depth + 1)
+        return
+    if isinstance(value, (list, tuple)):
+        if len(value) > MAX_LIST_ITEMS_PER_MARK:
+            raise ValueError(f"ERR_MARK_TOO_MANY_POINTS: {where} has {len(value)} items (limit {MAX_LIST_ITEMS_PER_MARK})")
+        for i, inner in enumerate(value):
+            _validate_mark_numbers(inner, f"{where}[{i}]", depth + 1)
+
+
 def normalize_marks_for_canvas(
     raw_marks: Sequence[Union[DrawingMark, Dict[str, Any]]],
     width: int,
@@ -219,11 +254,45 @@ def normalize_marks_for_canvas(
         raise ValueError(
             f"Mark count {len(raw_marks)} exceeds MAX_MARKS_PER_SOURCE ({MAX_MARKS_PER_SOURCE})"
         )
-    if mirror not in ("none", "x", "y", "xy"):
-        raise ValueError(f"Unsupported mirror mode: {mirror!r}")
+    mirror = MIRROR_ALIASES.get(mirror, mirror)
+    if mirror not in MIRROR_MODES:
+        raise ValueError(f"Unsupported mirror mode: {mirror!r}; use one of {sorted(MIRROR_MODES)}")
 
     normalized_specs: List[Dict[str, Any]] = []
     proxy_128_marks: List[DrawingMark] = []
+
+    def _mirror_item_specs(start: int) -> None:
+        """Append left-right / top-bottom reflections of the specs one non-Prism mark produced."""
+        if mirror == "none":
+            return
+        flips = {"x": [(True, False)], "y": [(False, True)], "xy": [(True, False), (False, True), (True, True)]}[mirror]
+        produced = normalized_specs[start:]
+        for mx, my in flips:
+            fx = (lambda v: width - 1 - int(v)) if mx else (lambda v: int(v))
+            fy = (lambda v: height - 1 - int(v)) if my else (lambda v: int(v))
+            suffix = {(True, False): "_mx", (False, True): "_my", (True, True): "_mxy"}[(mx, my)]
+            for spec in produced:
+                extra = {k: v for k, v in spec.items() if k not in ("mark_id", "op_kind", "x0", "y0", "x1", "y1", "rgba")}
+                for key in ("cx", "icx"):
+                    if key in extra:
+                        extra[key] = fx(extra[key])
+                for key in ("cy", "icy"):
+                    if key in extra:
+                        extra[key] = fy(extra[key])
+                if spec["op_kind"] in ("polygon", "compound_polygon"):
+                    # Filled shapes keep their points and are flipped span by span when drawn.
+                    extra["flip"] = (mx, my)
+                elif "points" in extra:
+                    extra["points"] = [(fx(x), fy(y)) for x, y in extra["points"]]
+                if "rotation_deg" in extra and mx != my:
+                    extra["rotation_deg"] = -float(extra["rotation_deg"])
+                _append_spec_and_proxy(
+                    mark_id=f"{spec['mark_id']}{suffix}"[:48],
+                    op_kind=spec["op_kind"],
+                    bbox_px=(fx(spec["x0"]), fy(spec["y0"]), fx(spec["x1"]), fy(spec["y1"])),
+                    rgba=tuple(spec["rgba"]),  # type: ignore[arg-type]
+                    extra=extra,
+                )
 
     def _append_spec_and_proxy(
         mark_id: str,
@@ -238,6 +307,9 @@ def normalize_marks_for_canvas(
             max(0, min(width - 1, int(bbox_px[2]))),
             max(0, min(height - 1, int(bbox_px[3]))),
         )
+        if "stroke_w" in extra:
+            # Anything wider than twice the canvas already covers it; the bound keeps stroke cost fixed.
+            extra = {**extra, "stroke_w": max(1, min(2 * max(width, height) + 1, int(extra["stroke_w"])))}
         spec = {
             "mark_id": mark_id,
             "op_kind": op_kind,
@@ -275,6 +347,7 @@ def normalize_marks_for_canvas(
             )
 
     for idx, item in enumerate(raw_marks):
+        item_start = len(normalized_specs)
         if isinstance(item, DrawingMark):
             _append_spec_and_proxy(
                 mark_id=item.mark_id,
@@ -283,12 +356,14 @@ def normalize_marks_for_canvas(
                 rgba=tuple(int(c) for c in item.rgba),  # type: ignore[arg-type]
                 extra={},
             )
+            _mirror_item_specs(item_start)
             continue
 
         if not isinstance(item, dict):
             raise ValueError(f"Mark at index {idx} must be a DrawingMark or dict")
 
         _validate_mark_hygiene(item)
+        _validate_mark_numbers(item, f"mark {idx}")
         mid = str(item.get("mark_id") or item.get("as") or f"mk_{idx:04d}")
         mid = re.sub(r"[^a-zA-Z0-9_]", "_", mid)[:48] or f"mk_{idx:04d}"
 
@@ -305,7 +380,14 @@ def normalize_marks_for_canvas(
                 rgba=rgba,
                 extra={},
             )
+            _mirror_item_specs(item_start)
             continue
+
+        # Models often name the Prism kind `type` or `kind`; with no world-operation geometry, read it as `k`.
+        if "k" not in item and "geometry" not in item:
+            alias = item.get("type", item.get("kind"))
+            if isinstance(alias, str) and alias in PRISM_MARK_KINDS:
+                item = {**{k: v for k, v in item.items() if k not in ("type", "kind")}, "k": alias}
 
         # Case 2: Spark & Prism normalized `[0..1]` mark vocabulary (`k` field)
         if "k" in item:
@@ -386,19 +468,27 @@ def normalize_marks_for_canvas(
                     pts_raw = item.get("pts", [])
                     if not isinstance(pts_raw, list) or len(pts_raw) < 3:
                         raise ValueError("Prism fill mark requires at least 3 points in 'pts'")
-                    pts_px = [(_tx(float(p[0])), _ty(float(p[1]))) for p in pts_raw]
-                    xs = [p[0] for p in pts_px]
-                    ys = [p[1] for p in pts_px]
+                    # Mirrored fills reuse the unmirrored points and flip spans when drawn (exact reflection).
+                    pts_px = [
+                        (max(0, min(width - 1, int(round(float(p[0]) * (width - 1))))),
+                         max(0, min(height - 1, int(round(float(p[1]) * (height - 1))))))
+                        for p in pts_raw
+                    ]
+                    xs = [width - 1 - p[0] if mx_flip else p[0] for p in pts_px]
+                    ys = [height - 1 - p[1] if my_flip else p[1] for p in pts_px]
                     _append_spec_and_proxy(
                         mark_id=sub_id,
                         op_kind="polygon",
                         bbox_px=(min(xs), min(ys), max(xs), max(ys)),
                         rgba=rgba,
-                        extra={"points": pts_px},
+                        extra={"points": pts_px, **({"flip": (mx_flip, my_flip)} if mx_flip or my_flip else {})},
                     )
 
             _emit_prism_single("", False, False)
             mark_mirror = str(item.get("mirror", mirror))
+            mark_mirror = MIRROR_ALIASES.get(mark_mirror, mark_mirror)
+            if mark_mirror not in MIRROR_MODES:
+                raise ValueError(f"Unsupported mirror mode on mark {idx}: {mark_mirror!r}")
             if mark_mirror in ("x", "xy"):
                 _emit_prism_single("_mx", True, False)
             if mark_mirror in ("y", "xy"):
@@ -578,6 +668,7 @@ def normalize_marks_for_canvas(
                     rgba=rgba,
                     extra={"points": pts_px, "stroke_w": sw},
                 )
+            _mirror_item_specs(item_start)
             continue
 
         # Case 4: `CYCLOPS_DRAW_WORLD_V3` operation object (`operationId`, `type`, `geometry`, `appearance`)
@@ -691,6 +782,7 @@ def normalize_marks_for_canvas(
                             rgba=rgba,
                             extra={"points": pts_first, "stroke_w": sw},
                         )
+            _mirror_item_specs(item_start)
             continue
 
         # Case 5: `drawing.json` v2 vector object (`kind == "vector"`, `bounds`, `settings`)
@@ -790,23 +882,80 @@ def normalize_marks_for_canvas(
                             rgba=rgba,
                             extra={"points": pts_first, "stroke_w": sw},
                         )
+            _mirror_item_specs(item_start)
             continue
 
-        raise ValueError(f"Unrecognized mark format at index {idx}: {list(item.keys())}")
+        raise ValueError(
+            f"Unrecognized mark format at index {idx}: {list(item.keys())}. Use a Prism mark in 0..1 units, "
+            f"e.g. {{\"k\":\"ring\",\"x\":0.5,\"y\":0.5,\"r\":0.2,\"w\":0.02,\"c\":[255,0,0]}} "
+            f"(k: {', '.join(sorted(PRISM_MARK_KINDS))}), or a cyclopsdraw shape in pixels, "
+            f"e.g. {{\"shape\":\"rect\",\"x\":10,\"y\":10,\"width\":40,\"height\":20,\"fill\":{{\"color\":\"#00ff00\"}}}}"
+        )
 
     return normalized_specs, proxy_128_marks
+
+
+# Each filled row costs 4 units, each line step 1; ~1.6M units is a couple of seconds at 1080p.
+RASTER_WORK_BUDGET = 1_600_000
+LINE_CLIP_SLACK_PX = 64
+
+
+def _clip_segment(
+    x0: int, y0: int, x1: int, y1: int, xmin: int, ymin: int, xmax: int, ymax: int
+) -> Optional[Tuple[int, int, int, int]]:
+    """Liang-Barsky clip of a segment to a box; returns rounded endpoints or None when fully outside."""
+    dx = float(x1 - x0)
+    dy = float(y1 - y0)
+    t0, t1 = 0.0, 1.0
+    for p, q in ((-dx, float(x0 - xmin)), (dx, float(xmax - x0)), (-dy, float(y0 - ymin)), (dy, float(ymax - y0))):
+        if p == 0.0:
+            if q < 0.0:
+                return None
+            continue
+        t = q / p
+        if p < 0.0:
+            if t > t1:
+                return None
+            t0 = max(t0, t)
+        else:
+            if t < t0:
+                return None
+            t1 = min(t1, t)
+    return (
+        int(round(x0 + t0 * dx)),
+        int(round(y0 + t0 * dy)),
+        int(round(x0 + t1 * dx)),
+        int(round(y0 + t1 * dy)),
+    )
 
 
 def _rasterize_normalized_specs(
     specs: Sequence[Dict[str, Any]],
     width: int,
     height: int,
+    base: Optional[bytes] = None,
 ) -> bytes:
     """
     Deterministic integer/Bresenham/scanline rasterizer for normalized mark specs.
     Executed strictly inside the private lexical closure vault.
+
+    Every filled shape is written as whole row spans, so cost grows with the rows a
+    mark covers rather than its pixel area. Line segments reaching well beyond the edge
+    are clipped before walking, so far-away endpoints cannot stall a call, and the total
+    work is counted so an oversized drawing is refused instead of running past timeouts.
+    `base`, when given, is the starting buffer instead of a transparent canvas.
     """
-    buf = bytearray(width * height * 4)
+    buf = bytearray(base) if base is not None else bytearray(width * height * 4)
+    work = [0]
+
+    def _charge(units: int) -> None:
+        work[0] += units
+        if work[0] > RASTER_WORK_BUDGET:
+            explicit_zeroize_bytearray(buf)
+            raise ValueError(
+                "ERR_DRAWING_TOO_COMPLEX: this canvas needs too much drawing work for one call; "
+                "use fewer or smaller marks, thinner strokes, fewer points or a smaller canvas"
+            )
 
     def _set_px(x: int, y: int, r: int, g: int, b: int, a: int) -> None:
         if 0 <= x < width and 0 <= y < height:
@@ -816,21 +965,57 @@ def _rasterize_normalized_specs(
             buf[off + 2] = b
             buf[off + 3] = a
 
+    def _fill_span(y: int, xa: int, xb: int, px: bytes) -> None:
+        _charge(4)
+        if y < 0 or y >= height:
+            return
+        xa = max(0, xa)
+        xb = min(width - 1, xb)
+        if xa <= xb:
+            start = (y * width + xa) * 4
+            buf[start : start + (xb - xa + 1) * 4] = px * (xb - xa + 1)
+
     def _draw_line(x0: int, y0: int, x1: int, y1: int, r: int, g: int, b: int, a: int, w: int = 1) -> None:
+        rad = max(0, (w - 1) // 2)
+        # Some slack keeps ordinary off-edge strokes pixel-identical to an unclipped walk.
+        pad = rad + 1 + LINE_CLIP_SLACK_PX
+        lo_x, lo_y, hi_x, hi_y = -pad, -pad, width + pad, height + pad
+        if not (lo_x <= x0 <= hi_x and lo_x <= x1 <= hi_x and lo_y <= y0 <= hi_y and lo_y <= y1 <= hi_y):
+            clipped = _clip_segment(x0, y0, x1, y1, lo_x, lo_y, hi_x, hi_y)
+            if clipped is None:
+                return
+            x0, y0, x1, y1 = clipped
         dx = abs(x1 - x0)
         sx = 1 if x0 < x1 else -1
         dy = -abs(y1 - y0)
         sy = 1 if y0 < y1 else -1
         err = dx + dy
-        rad = max(0, (w - 1) // 2)
         cx, cy = x0, y0
-        while True:
-            if rad == 0:
+        _charge(max(dx, -dy) + 1)
+        if rad == 0:
+            while True:
                 _set_px(cx, cy, r, g, b, a)
+                if cx == x1 and cy == y1:
+                    break
+                e2 = 2 * err
+                if e2 >= dy:
+                    err += dy
+                    cx += sx
+                if e2 <= dx:
+                    err += dx
+                    cy += sy
+            return
+        # Thick stroke = union of (2*rad+1)^2 squares centred on the Bresenham path. The path is
+        # monotone in x and y, so each row of that union is one span: [min cx - rad, max cx + rad]
+        # over the path points within rad rows, and those extremes sit at the ends of that range.
+        row_min: Dict[int, int] = {}
+        row_max: Dict[int, int] = {}
+        while True:
+            if cy in row_min:
+                row_min[cy] = min(row_min[cy], cx)
+                row_max[cy] = max(row_max[cy], cx)
             else:
-                for oy in range(-rad, rad + 1):
-                    for ox in range(-rad, rad + 1):
-                        _set_px(cx + ox, cy + oy, r, g, b, a)
+                row_min[cy] = row_max[cy] = cx
             if cx == x1 and cy == y1:
                 break
             e2 = 2 * err
@@ -840,10 +1025,17 @@ def _rasterize_normalized_specs(
             if e2 <= dx:
                 err += dx
                 cy += sy
+        y_first, y_last = min(row_min), max(row_min)
+        px = bytes((r, g, b, a))
+        for y in range(max(0, y_first - rad), min(height - 1, y_last + rad) + 1):
+            lo = max(y - rad, y_first)
+            hi = min(y + rad, y_last)
+            _fill_span(y, min(row_min[lo], row_min[hi]) - rad, max(row_max[lo], row_max[hi]) + rad, px)
 
     for spec in specs:
         op = spec["op_kind"]
         r, g, b, a = spec["rgba"]
+        px = bytes((r, g, b, a))
         x0, y0, x1, y1 = spec["x0"], spec["y0"], spec["x1"], spec["y1"]
 
         if op == "dot":
@@ -856,7 +1048,8 @@ def _rasterize_normalized_specs(
             ya = max(0, min(height - 1, ya))
             yb = max(0, min(height - 1, yb))
             row_span = (xb - xa + 1) * 4
-            pixel_Run = bytes((r, g, b, a)) * (xb - xa + 1)
+            pixel_Run = px * (xb - xa + 1)
+            _charge(4 * (yb - ya + 1))
             for y in range(ya, yb + 1):
                 start = (y * width + xa) * 4
                 buf[start : start + row_span] = pixel_Run
@@ -872,18 +1065,9 @@ def _rasterize_normalized_specs(
             cy = int(spec.get("cy", (y0 + y1) // 2))
             rad = max(1, int(spec.get("radius", max(1, (x1 - x0) // 2))))
             r2 = rad * rad
-            ya = max(0, cy - rad)
-            yb = min(height - 1, cy + rad)
-            for y in range(ya, yb + 1):
-                dy2 = (y - cy) * (y - cy)
-                max_dx = int(math.isqrt(max(0, r2 - dy2)))
-                xa = max(0, cx - max_dx)
-                xb = min(width - 1, cx + max_dx)
-                if xa <= xb:
-                    span = (xb - xa + 1) * 4
-                    buf[(y * width + xa) * 4 : (y * width + xa) * 4 + span] = (
-                        bytes((r, g, b, a)) * (xb - xa + 1)
-                    )
+            for y in range(max(0, cy - rad), min(height - 1, cy + rad) + 1):
+                max_dx = int(math.isqrt(max(0, r2 - (y - cy) * (y - cy))))
+                _fill_span(y, cx - max_dx, cx + max_dx, px)
         elif op == "ring":
             cx = int(spec.get("cx", (x0 + x1) // 2))
             cy = int(spec.get("cy", (y0 + y1) // 2))
@@ -891,16 +1075,16 @@ def _rasterize_normalized_specs(
             inner_r = max(0, int(spec.get("inner_r", outer_r - 2)))
             or2 = outer_r * outer_r
             ir2 = inner_r * inner_r
-            ya = max(0, cy - outer_r)
-            yb = min(height - 1, cy + outer_r)
-            for y in range(ya, yb + 1):
+            for y in range(max(0, cy - outer_r), min(height - 1, cy + outer_r) + 1):
                 dy2 = (y - cy) * (y - cy)
-                xa = max(0, cx - outer_r)
-                xb = min(width - 1, cx + outer_r)
-                for x in range(xa, xb + 1):
-                    d2 = (x - cx) * (x - cx) + dy2
-                    if ir2 <= d2 <= or2:
-                        _set_px(x, y, r, g, b, a)
+                ao = math.isqrt(or2 - dy2)
+                # Pixels with ir2 <= d2 <= or2: the outer span minus the strictly-inside span.
+                if ir2 - dy2 >= 1:
+                    ai = math.isqrt(ir2 - dy2 - 1)
+                    _fill_span(y, cx - ao, min(cx + ao, cx - ai - 1), px)
+                    _fill_span(y, max(cx - ao, cx + ai + 1), cx + ao, px)
+                else:
+                    _fill_span(y, cx - ao, cx + ao, px)
         elif op == "crescent":
             cx = int(spec.get("cx", (x0 + x1) // 2))
             cy = int(spec.get("cy", (y0 + y1) // 2))
@@ -910,19 +1094,16 @@ def _rasterize_normalized_specs(
             inner_r = max(1, int(spec.get("inner_r", 15)))
             or2 = outer_r * outer_r
             ir2 = inner_r * inner_r
-            ya = max(0, cy - outer_r)
-            yb = min(height - 1, cy + outer_r)
-            xa = max(0, cx - outer_r)
-            xb = min(width - 1, cx + outer_r)
-            for y in range(ya, yb + 1):
-                dy_o = y - cy
-                dy_i = y - icy
-                for x in range(xa, xb + 1):
-                    dx_o = x - cx
-                    if dx_o * dx_o + dy_o * dy_o <= or2:
-                        dx_i = x - icx
-                        if dx_i * dx_i + dy_i * dy_i > ir2:
-                            _set_px(x, y, r, g, b, a)
+            for y in range(max(0, cy - outer_r), min(height - 1, cy + outer_r) + 1):
+                ao = math.isqrt(or2 - (y - cy) * (y - cy))
+                oa, ob = cx - ao, cx + ao
+                dyi2 = (y - icy) * (y - icy)
+                if dyi2 <= ir2:
+                    ai = math.isqrt(ir2 - dyi2)
+                    _fill_span(y, oa, min(ob, icx - ai - 1), px)
+                    _fill_span(y, max(oa, icx + ai + 1), ob, px)
+                else:
+                    _fill_span(y, oa, ob, px)
         elif op == "ellipse":
             cx = int(spec.get("cx", (x0 + x1) // 2))
             cy = int(spec.get("cy", (y0 + y1) // 2))
@@ -932,20 +1113,40 @@ def _rasterize_normalized_specs(
             cos_t = math.cos(-rot_rad)
             sin_t = math.sin(-rot_rad)
             max_r = max(rx, ry)
-            ya = max(0, cy - max_r)
-            yb = min(height - 1, cy + max_r)
             xa = max(0, cx - max_r)
             xb = min(width - 1, cx + max_r)
             rx2 = float(rx * rx)
             ry2 = float(ry * ry)
-            for y in range(ya, yb + 1):
+            qa = (cos_t * cos_t) / rx2 + (sin_t * sin_t) / ry2
+            for y in range(max(0, cy - max_r), min(height - 1, cy + max_r) + 1):
                 dy = float(y - cy)
-                for x in range(xa, xb + 1):
-                    dx = float(x - cx)
-                    u = dx * cos_t - dy * sin_t
-                    v = dx * sin_t + dy * cos_t
-                    if (u * u) / rx2 + (v * v) / ry2 <= 1.0:
-                        _set_px(x, y, r, g, b, a)
+
+                def _inside(x: int) -> bool:
+                    ddx = float(x - cx)
+                    u = ddx * cos_t - dy * sin_t
+                    v = ddx * sin_t + dy * cos_t
+                    return (u * u) / rx2 + (v * v) / ry2 <= 1.0
+
+                # Each row of an ellipse is one interval: solve the quadratic for a first guess,
+                # then settle both ends with the exact per-pixel test used before.
+                qb = 2.0 * dy * (-cos_t * sin_t / rx2 + sin_t * cos_t / ry2)
+                qc = dy * dy * ((sin_t * sin_t) / rx2 + (cos_t * cos_t) / ry2) - 1.0
+                disc = qb * qb - 4.0 * qa * qc
+                mid = -qb / (2.0 * qa)
+                half = math.sqrt(disc) / (2.0 * qa) if disc > 0.0 else 0.0
+                lo = max(xa, min(xb, cx + int(math.floor(mid - half))))
+                hi = max(xa, min(xb, cx + int(math.ceil(mid + half))))
+                while lo <= hi and not _inside(lo):
+                    lo += 1
+                if lo > hi:
+                    continue
+                while lo > xa and _inside(lo - 1):
+                    lo -= 1
+                while hi > lo and not _inside(hi):
+                    hi -= 1
+                while hi < xb and _inside(hi + 1):
+                    hi += 1
+                _fill_span(y, lo, hi, px)
         elif op == "spray":
             cx = int(spec.get("cx", (x0 + x1) // 2))
             cy = int(spec.get("cy", (y0 + y1) // 2))
@@ -956,63 +1157,38 @@ def _rasterize_normalized_specs(
             for idx in range(n_dots):
                 frac = math.sqrt((idx + 0.5) / n_dots)
                 theta = idx * golden_angle
-                px = int(round(cx + frac * rad * math.cos(theta)))
-                py = int(round(cy + frac * rad * math.sin(theta)))
-                _set_px(px, py, r, g, b, a)
-        elif op == "polygon":
-            pts = spec.get("points", [])
-            if len(pts) >= 3:
-                ys = [p[1] for p in pts]
-                ya = max(0, min(ys))
-                yb = min(height - 1, max(ys))
-                n_pts = len(pts)
-                for y in range(ya, yb + 1):
+                px_x = int(round(cx + frac * rad * math.cos(theta)))
+                px_y = int(round(cy + frac * rad * math.sin(theta)))
+                _set_px(px_x, px_y, r, g, b, a)
+        elif op in ("polygon", "compound_polygon"):
+            rings = [spec.get("points", [])] if op == "polygon" else spec.get("subpaths", [])
+            rings = [ring for ring in rings if len(ring) >= 3]
+            if rings:
+                edges = [
+                    (ring[i][0], ring[i][1], ring[(i + 1) % len(ring)][0], ring[(i + 1) % len(ring)][1])
+                    for ring in rings
+                    for i in range(len(ring))
+                    if ring[i][1] != ring[(i + 1) % len(ring)][1]
+                ]
+                all_ys = [p[1] for ring in rings for p in ring]
+                # A mirrored copy keeps the source points and flips the filled spans, so it is an exact
+                # pixel reflection (re-scanning reflected points rounds edges differently).
+                flip_x, flip_y = spec.get("flip", (False, False))
+                for y in range(max(0, min(all_ys)), min(height - 1, max(all_ys)) + 1):
+                    _charge(1 + len(edges) // 4)
+                    row = height - 1 - y if flip_y else y
                     intersections: List[int] = []
-                    for i in range(n_pts):
-                        px1, py1 = pts[i]
-                        px2, py2 = pts[(i + 1) % n_pts]
-                        if py1 == py2:
-                            continue
+                    for px1, py1, px2, py2 in edges:
                         if min(py1, py2) <= y < max(py1, py2):
-                            x_int = px1 + ((y - py1) * (px2 - px1)) // (py2 - py1)
-                            intersections.append(x_int)
+                            intersections.append(px1 + ((y - py1) * (px2 - px1)) // (py2 - py1))
                     intersections.sort()
                     for k_idx in range(0, len(intersections) - 1, 2):
                         xa = max(0, min(width - 1, intersections[k_idx]))
                         xb = max(0, min(width - 1, intersections[k_idx + 1]))
                         if xa <= xb:
-                            span = (xb - xa + 1) * 4
-                            buf[(y * width + xa) * 4 : (y * width + xa) * 4 + span] = (
-                                bytes((r, g, b, a)) * (xb - xa + 1)
-                            )
-        elif op == "compound_polygon":
-            subpaths = spec.get("subpaths", [])
-            valid_sps = [sp for sp in subpaths if len(sp) >= 3]
-            if valid_sps:
-                all_ys = [p[1] for sp in valid_sps for p in sp]
-                ya = max(0, min(all_ys))
-                yb = min(height - 1, max(all_ys))
-                for y in range(ya, yb + 1):
-                    intersections_cp: List[int] = []
-                    for sp in valid_sps:
-                        n_pts = len(sp)
-                        for i in range(n_pts):
-                            px1, py1 = sp[i]
-                            px2, py2 = sp[(i + 1) % n_pts]
-                            if py1 == py2:
-                                continue
-                            if min(py1, py2) <= y < max(py1, py2):
-                                x_int = px1 + ((y - py1) * (px2 - px1)) // (py2 - py1)
-                                intersections_cp.append(x_int)
-                    intersections_cp.sort()
-                    for k_idx in range(0, len(intersections_cp) - 1, 2):
-                        xa = max(0, min(width - 1, intersections_cp[k_idx]))
-                        xb = max(0, min(width - 1, intersections_cp[k_idx + 1]))
-                        if xa <= xb:
-                            span = (xb - xa + 1) * 4
-                            buf[(y * width + xa) * 4 : (y * width + xa) * 4 + span] = (
-                                bytes((r, g, b, a)) * (xb - xa + 1)
-                            )
+                            if flip_x:
+                                xa, xb = width - 1 - xb, width - 1 - xa
+                            _fill_span(row, xa, xb, px)
 
     out_bytes = bytes(buf)
     explicit_zeroize_bytearray(buf)
@@ -1055,6 +1231,29 @@ def _create_multi_res_closure_vault(
             "pixel_sha256": pixel_sha256,
             "spec_count": len(specs),
         }
+
+    def register_rgba(
+        source_id: str,
+        source_version: str,
+        width: int,
+        height: int,
+        rgba_bytes: bytes,
+    ) -> Dict[str, Any]:
+        """Stores a real picture's pixels (already fitted to a supported canvas) like a drawn canvas."""
+        key = (source_id, source_version)
+        if key in _buffers:
+            raise ValueError(f"Immutable source {source_id}@{source_version} already registered")
+        if len(rgba_bytes) != width * height * 4:
+            raise ValueError("RGBA buffer does not match the canvas size")
+        pixel_sha256 = _canonical_sha256_tag(rgba_bytes)
+        _buffers[key] = {
+            "width": width,
+            "height": height,
+            "rgba": bytearray(rgba_bytes),
+            "pixel_sha256": pixel_sha256,
+            "spec_count": 0,
+        }
+        return {"width": width, "height": height, "pixel_sha256": pixel_sha256, "spec_count": 0}
 
     def run_native_simd_suite(
         source_a: Tuple[str, str],
@@ -1167,6 +1366,10 @@ def _create_multi_res_closure_vault(
             "fast_path_identical_sha": False,
         }
 
+    def dimensions(source_key: Tuple[str, str]) -> Tuple[int, int]:
+        entry = _buffers[source_key]
+        return entry["width"], entry["height"]
+
     def sample_pixel_rgba(
         source_key: Tuple[str, str],
         x: int,
@@ -1203,21 +1406,19 @@ def _create_multi_res_closure_vault(
         base_entry = _buffers[base_source_key]
         w, h = base_entry["width"], base_entry["height"]
         base_rgba = bytes(base_entry["rgba"])
-        ghost_only_rgba = _rasterize_normalized_specs(ghost_specs, w, h)
-
-        # Composite non-transparent ghost pixels over base in a disposable bytearray
-        composite = bytearray(base_rgba)
-        total_bytes = w * h * 4
-        for off in range(0, total_bytes, 4):
-            ga = ghost_only_rgba[off + 3]
-            if ga > 0:
-                composite[off] = ghost_only_rgba[off]
-                composite[off + 1] = ghost_only_rgba[off + 1]
-                composite[off + 2] = ghost_only_rgba[off + 2]
-                composite[off + 3] = ga
-
-        composite_bytes = bytes(composite)
-        explicit_zeroize_bytearray(composite)
+        if all(int(spec["rgba"][3]) > 0 for spec in ghost_specs):
+            # Every ghost pixel is opaque enough to replace the base, so painting the ghost specs
+            # straight onto a copy of the base gives the same composite in one pass.
+            composite_bytes = _rasterize_normalized_specs(ghost_specs, w, h, base=base_rgba)
+        else:
+            ghost_only_rgba = _rasterize_normalized_specs(ghost_specs, w, h)
+            composite = bytearray(base_rgba)
+            for off in range(3, w * h * 4, 4):
+                ga = ghost_only_rgba[off]
+                if ga > 0:
+                    composite[off - 3 : off + 1] = ghost_only_rgba[off - 3 : off + 1]
+            composite_bytes = bytes(composite)
+            explicit_zeroize_bytearray(composite)
 
         metrics = simd_engine.run_full_10_operator_suite_native(
             composite_bytes,
@@ -1234,6 +1435,83 @@ def _create_multi_res_closure_vault(
             "base_pixel_sha256_preserved": True,
             "hypothetical_metrics": metrics,
         }
+
+    def downsample_proxy_marks(
+        source_key: Tuple[str, str], max_marks: int, colour_bits: int = 8
+    ) -> Optional[List[DrawingMark]]:
+        """
+        Encodes a 128x128 nearest-centre downsample of the native canvas as rectangle marks for
+        the 128x128 harness, so proxy measurements see the real shapes rather than bounding boxes.
+        `colour_bits` < 8 keeps only the top bits of each colour channel, which merges the near
+        colours of photos into fewer rectangles. Returns None when more than `max_marks` are needed.
+        """
+        if source_key not in _buffers:
+            raise KeyError(f"Unknown source: {source_key}")
+        entry = _buffers[source_key]
+        w, h, rgba = entry["width"], entry["height"], entry["rgba"]
+        cols = [((2 * px + 1) * w) // 256 for px in range(128)]
+        empty = b"\0\0\0\0"
+        mask = (0xFF << (8 - colour_bits)) & 0xFF
+
+        def _quantized(px: bytes) -> bytes:
+            if colour_bits >= 8 or px == empty:
+                return px
+            return bytes((px[0] & mask, px[1] & mask, px[2] & mask, max(1, px[3] & mask) if px[3] else 0))
+
+        open_rects: Dict[Tuple[int, int, bytes], List[int]] = {}
+        rects: List[List[Any]] = []
+        for py in range(128):
+            row_off = (((2 * py + 1) * h) // 256) * w * 4
+            row = [_quantized(bytes(rgba[row_off + sx * 4 : row_off + sx * 4 + 4])) for sx in cols]
+            still_open: Dict[Tuple[int, int, bytes], List[int]] = {}
+            x = 0
+            while x < 128:
+                px = row[x]
+                if px == empty:
+                    x += 1
+                    continue
+                x0 = x
+                while x + 1 < 128 and row[x + 1] == px:
+                    x += 1
+                key = (x0, x, px)
+                rect = open_rects.get(key)
+                if rect is not None:
+                    rect[3] = py
+                else:
+                    rect = [x0, py, x, py, px]
+                    rects.append(rect)
+                    if len(rects) > max_marks:
+                        return None
+                still_open[key] = rect
+                x += 1
+            open_rects = still_open
+        return [
+            DrawingMark(mark_id=f"px_{i:04d}", shape="rect", x0=r[0], y0=r[1], x1=r[2], y1=r[3], rgba=tuple(r[4]))
+            for i, r in enumerate(rects)
+        ]
+
+    def block_proxy_marks(source_key: Tuple[str, str], block: int = 8) -> List[DrawingMark]:
+        """Last-resort proxy: the 128x128 downsample as `block`-pixel squares of their mean colour."""
+        entry = _buffers[source_key]
+        w, h, rgba = entry["width"], entry["height"], entry["rgba"]
+        marks: List[DrawingMark] = []
+        for by in range(0, 128, block):
+            for bx in range(0, 128, block):
+                sums = [0, 0, 0, 0]
+                n = 0
+                for py in range(by, by + block):
+                    row_off = (((2 * py + 1) * h) // 256) * w * 4
+                    for px in range(bx, bx + block):
+                        off = row_off + (((2 * px + 1) * w) // 256) * 4
+                        for c in range(4):
+                            sums[c] += rgba[off + c]
+                        n += 1
+                if sums[3] == 0:
+                    continue
+                colour = tuple(int(round(v / n)) for v in sums)
+                marks.append(DrawingMark(mark_id=f"blk_{len(marks):04d}", shape="rect", x0=bx, y0=by,
+                                         x1=bx + block - 1, y1=by + block - 1, rgba=colour))  # type: ignore[arg-type]
+        return marks
 
     def evict_source(source_key: Tuple[str, str]) -> Dict[str, Any]:
         """Explicitly zeroizes (`explicit_bzero`) and evicts a single source frame from the ring buffer."""
@@ -1277,6 +1555,10 @@ def _create_multi_res_closure_vault(
         "run_native_simd_suite": run_native_simd_suite,
         "compute_dirty_tiles_16x16": compute_dirty_tiles_16x16,
         "sample_pixel_rgba": sample_pixel_rgba,
+        "downsample_proxy_marks": downsample_proxy_marks,
+        "block_proxy_marks": block_proxy_marks,
+        "register_rgba": register_rgba,
+        "dimensions": dimensions,
         "preview_ghost_specs": preview_ghost_specs,
         "evict_source": evict_source,
         "purge_all": purge_all,
@@ -1425,30 +1707,119 @@ class ElectricVisionAgentSession:
             raise ValueError(f"Resolution {(w, h)} not in SUPPORTED_RESOLUTIONS {SUPPORTED_RESOLUTIONS}")
 
         specs, proxy_128_marks = normalize_marks_for_canvas(marks, w, h, mirror=mirror)
-
-        # Register 128x128 proxy in out-of-process harness (enforces EXEC-GATE-3 admission firewall)
-        desc = harness.register_verified_source(
-            source_id=source_id,
-            source_version=source_version,
-            source_kind=source_kind,
-            marks=proxy_128_marks,
-            origin_attestation=origin_attestation,
-        )
+        key = (source_id, source_version)
+        if key in self._source_dimensions:
+            raise ValueError(f"ERR_IMMUTABLE_SOURCE_OVERWRITE: Cannot overwrite {source_id}@{source_version}")
 
         # Register native resolution buffer in private closure vault
         mr_info = self._multi_res_vault["register_canvas"](source_id, source_version, w, h, specs)
-        self._source_dimensions[(source_id, source_version)] = (w, h)
+        desc, proxy_fidelity = self._register_proxy(key, source_kind, origin_attestation, fallback=proxy_128_marks)
 
-        out = {
+        out = self._registration_reply(desc, proxy_fidelity, w, h, mr_info, mirror, origin_attestation)
+        assert_no_raw_buffer_leakage(out)
+        return out
+
+    def _register_proxy(
+        self,
+        key: Tuple[str, str],
+        source_kind: str,
+        origin_attestation: str,
+        *,
+        fallback: Optional[Sequence[DrawingMark]] = None,
+    ) -> Tuple[Dict[str, Any], str]:
+        """
+        Registers the 128x128 harness proxy for a canvas already in the vault: an exact downsample
+        when it fits the mark budget, then colour-quantized ones, then `fallback` marks or 8-px
+        blocks. Evicts the vault entry if the harness refuses it. Returns (descriptor, fidelity).
+        """
+        harness = self._require_active()
+        try:
+            marks: Optional[Sequence[DrawingMark]] = None
+            fidelity = ""
+            for bits in (8, 5, 4, 3, 2):
+                marks = self._multi_res_vault["downsample_proxy_marks"](key, MAX_MARKS_PER_SOURCE, bits)
+                if marks is not None:
+                    fidelity = "downsampled_pixels" if bits == 8 else f"downsampled_pixels_{bits}bit_colour"
+                    break
+                if fallback is not None:
+                    # Drawn canvases fall back to their own mark boxes straight away, as before.
+                    break
+            if marks is None:
+                if fallback is not None:
+                    marks, fidelity = fallback, "approximate_bounding_boxes"
+                else:
+                    marks, fidelity = self._multi_res_vault["block_proxy_marks"](key), "approximate_8px_blocks"
+            # Register 128x128 proxy in out-of-process harness (enforces EXEC-GATE-3 admission firewall)
+            desc = harness.register_verified_source(
+                source_id=key[0],
+                source_version=key[1],
+                source_kind=source_kind,
+                marks=marks,
+                origin_attestation=origin_attestation,
+            )
+        except BaseException:
+            self._multi_res_vault["evict_source"](key)
+            raise
+        self._source_dimensions[key] = self._multi_res_vault["dimensions"](key)
+        return desc, fidelity
+
+    def register_pixel_canvas(
+        self,
+        source_id: str,
+        source_version: str,
+        rgba_bytes: bytes,
+        width: int,
+        height: int,
+        *,
+        source_kind: str = "image_bytes",
+        origin_attestation: str = "owner_supplied_picture",
+        origin: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Registers a real picture (an image, SVG, video frame or page capture already fitted to a
+        supported canvas) so every measurement, diff, ghost and stream tool can use it.
+        """
+        self._require_active()
+        if (width, height) not in SUPPORTED_RESOLUTIONS:
+            raise ValueError(f"Resolution {(width, height)} not in SUPPORTED_RESOLUTIONS {SUPPORTED_RESOLUTIONS}")
+        key = (source_id, source_version)
+        if key in self._source_dimensions:
+            raise ValueError(f"ERR_IMMUTABLE_SOURCE_OVERWRITE: Cannot overwrite {source_id}@{source_version}")
+        mr_info = self._multi_res_vault["register_rgba"](source_id, source_version, width, height, rgba_bytes)
+        desc, fidelity = self._register_proxy(key, source_kind, origin_attestation)
+        out = self._registration_reply(desc, fidelity, width, height, mr_info, "none", origin_attestation)
+        out["origin"] = origin or {}
+        assert_no_raw_buffer_leakage(out)
+        return out
+
+    def _registration_reply(
+        self,
+        desc: Dict[str, Any],
+        proxy_fidelity: str,
+        w: int,
+        h: int,
+        mr_info: Dict[str, Any],
+        mirror: str,
+        origin_attestation: str,
+    ) -> Dict[str, Any]:
+        proxy_dims = desc.pop("dimensions")
+        proxy_marks = desc.pop("mark_count")
+        return {
             **desc,
             "native_resolution": {"width": w, "height": h, "total_pixels": w * h},
+            "proxy_resolution": {
+                "width": proxy_dims["width"],
+                "height": proxy_dims["height"],
+                "fidelity": proxy_fidelity,
+                "rectangles": proxy_marks,
+                "note": "Harness measurements (refuse queries, measure_bbox/count_objects, diff derived views) run on this downsample.",
+            },
             "native_pixel_sha256": mr_info["pixel_sha256"],
             "compiled_primitive_count": mr_info["spec_count"],
             "mirror_mode": mirror,
             "origin_attestation": origin_attestation,
+            "origin_attestation_checked": False,
         }
-        assert_no_raw_buffer_leakage(out)
-        return out
 
     def inspect_canvas(
         self,
@@ -1655,6 +2026,16 @@ class ElectricVisionAgentSession:
             "resolution": {"width": w_a, "height": h_a},
             "native_diff_metrics": native_diff_suite["op_bbox_aligned_diff_u8"],
             "derived_representations": derived_reps,
+            "derived_representations_resolution": {
+                "width": 128,
+                "height": 128,
+                "scale_to_native": {"x": round(w_a / 128.0, 6), "y": round(h_a / 128.0, 6)},
+                "note": (
+                    "native_diff_metrics are measured at the native resolution; derived_representations "
+                    "are measured on the 128x128 downsample, so multiply their pixel positions by "
+                    "scale_to_native and expect pixel counts near native / (scale.x * scale.y)."
+                ),
+            },
             "diff_replay_digest": diff_replay_digest,
             "epistemic_label": "derived",
             "observed": False,
@@ -1761,10 +2142,11 @@ class ElectricVisionAgentSession:
 
     def evict_synthetic_canvas(self, source_id: str, source_version: str) -> Dict[str, Any]:
         """Explicitly zeroizes (`explicit_bzero`) and evicts a single source revision from the multi-resolution closure vault."""
-        self._require_active()
+        harness = self._require_active()
         key = (source_id, source_version)
         self._source_dimensions.pop(key, None)
         res = self._multi_res_vault["evict_source"](key)
+        res["proxy_released"] = harness.release_source_pixels([key]) > 0
         assert_no_raw_buffer_leakage(res)
         return res
 
@@ -1870,8 +2252,32 @@ class ContinuousElectricEyeStream:
         self._observation_ledger: Dict[str, Dict[str, Any]] = {}
         self._staged_ghosts: Dict[str, Dict[str, Any]] = {}
         self._ghost_realizations: List[Dict[str, Any]] = []
-        self._eviction_log: List[Dict[str, Any]] = []
+        self._evicted_frame_count = 0
+        self._ghost_seq = 0
+        self._last_eviction: Optional[Dict[str, Any]] = None
         self._tick_counter = 0
+
+    # Per-version bookkeeping kept beyond the window, so freshness checks on recent versions still answer.
+    HISTORY_LIMIT = 64
+
+    def _prune_history(self) -> None:
+        keep = set(self._window_versions)
+        for book in (self._observation_ledger, self._staged_ghosts):
+            for old_key in list(book)[: max(0, len(book) - self.HISTORY_LIMIT)]:
+                if old_key not in keep:
+                    book.pop(old_key, None)
+        self._transition_records = [t for t in self._transition_records if t["to_version"] in keep]
+        del self._ghost_realizations[: max(0, len(self._ghost_realizations) - self.HISTORY_LIMIT)]
+
+    def release(self) -> int:
+        """Frees every frame this stream still holds in the session vaults (used by stream reset)."""
+        released = 0
+        for version in list(self._window_versions):
+            if self.session.evict_synthetic_canvas(self.source_id, version).get("evicted"):
+                released += 1
+        self._window_versions.clear()
+        self._frame_records.clear()
+        return released
 
     def stage_ghost_prediction(
         self,
@@ -1891,7 +2297,8 @@ class ContinuousElectricEyeStream:
             proposed_ghost_marks,
             mirror=mirror,
         )
-        gid = ghost_id or f"ghost_{len(self._staged_ghosts) + 1:04d}"
+        self._ghost_seq += 1
+        gid = ghost_id or f"ghost_{self._ghost_seq:04d}"
         record = {
             "ghost_id": gid,
             "base_source_id": self.source_id,
@@ -2027,6 +2434,9 @@ class ContinuousElectricEyeStream:
         mirror: str = "none",
         issue_observation_receipt: bool = False,
         verify_staged_ghost_id: Optional[str] = None,
+        rgba: Optional[bytes] = None,
+        origin: Optional[Dict[str, Any]] = None,
+        origin_attestation: str = "owner_supplied_picture",
     ) -> Dict[str, Any]:
         """
         Ingests a new synthetic frame into the Continuous Electric Eye stream:
@@ -2038,23 +2448,37 @@ class ContinuousElectricEyeStream:
              `settling_and_oscillation_detector`, `kinematic_trajectory_chain`).
         """
         t0 = time.perf_counter()
-        self._tick_counter += 1
         prev_version = self._window_versions[-1] if self._window_versions else None
 
-        reg = self.session.register_synthetic_canvas(
-            self.source_id,
-            source_version,
-            marks,
-            width=self.width,
-            height=self.height,
-            source_kind=source_kind,
-            mirror=mirror,
-        )
+        if rgba is not None:
+            # A real frame (video or page capture), already fitted to the stream's canvas.
+            reg = self.session.register_pixel_canvas(
+                self.source_id,
+                source_version,
+                rgba,
+                self.width,
+                self.height,
+                source_kind=source_kind,
+                origin_attestation=origin_attestation,
+                origin=origin,
+            )
+        else:
+            reg = self.session.register_synthetic_canvas(
+                self.source_id,
+                source_version,
+                marks,
+                width=self.width,
+                height=self.height,
+                source_kind=source_kind,
+                mirror=mirror,
+            )
         insp = self.session.inspect_canvas(
             self.source_id,
             source_version,
             issue_observation_receipt=issue_observation_receipt,
         )
+        # Count the tick only once the frame is in, so refused frames leave no gap.
+        self._tick_counter += 1
 
         # Record initial epistemic state in observation ledger
         if issue_observation_receipt and insp["render"]["observed"]:
@@ -2157,9 +2581,10 @@ class ContinuousElectricEyeStream:
         if len(self._window_versions) > self.max_window_frames:
             oldest_ver = self._window_versions.pop(0)
             self._frame_records.pop(oldest_ver, None)
-            self.session._source_dimensions.pop((self.source_id, oldest_ver), None)
-            eviction_receipt = self.session._multi_res_vault["evict_source"]((self.source_id, oldest_ver))
-            self._eviction_log.append(eviction_receipt)
+            eviction_receipt = self.session.evict_synthetic_canvas(self.source_id, oldest_ver)
+            self._evicted_frame_count += 1
+            self._last_eviction = eviction_receipt
+        self._prune_history()
 
         ghost_audit: Optional[Dict[str, Any]] = None
         if verify_staged_ghost_id is not None:
@@ -2235,18 +2660,15 @@ class ContinuousElectricEyeStream:
                     for t in tail_transitions
                 )
             )
-            # Detect non-trivial cycle (`A -> B -> A`): latest frame matches an earlier non-adjacent frame
+            # Detect non-trivial cycle (`A -> B -> A`): latest frame is pixel-identical to an earlier
+            # non-adjacent frame. A matching 64-bit dHash alone is too coarse (steady motion repeats it).
             latest_sha = dhash_sequence[-1]["native_pixel_sha256"]
-            latest_dh = dhash_sequence[-1]["dhash64"]
             earlier_non_adjacent = dhash_sequence[:-2]
             last_step_changed = bool(recent_transitions and recent_transitions[-1]["changed_pixels"] > 0)
             cycle_detected = bool(
                 not settled
                 and last_step_changed
-                and any(
-                    e["native_pixel_sha256"] == latest_sha or e["dhash64"] == latest_dh
-                    for e in earlier_non_adjacent
-                )
+                and any(e["native_pixel_sha256"] == latest_sha for e in earlier_non_adjacent)
             )
             if settled:
                 regime = "settled"
@@ -2345,9 +2767,9 @@ class ContinuousElectricEyeStream:
             "window_capacity": self.max_window_frames,
             "active_frame_count": n_frames,
             "active_versions": active_versions,
-            "evicted_frame_count": len(self._eviction_log),
+            "evicted_frame_count": self._evicted_frame_count,
             "cumulative_zeroized_bytes": (
-                self._eviction_log[-1]["cumulative_zeroized_bytes"] if self._eviction_log else 0
+                self._last_eviction.get("cumulative_zeroized_bytes", 0) if self._last_eviction else 0
             ),
             "epistemic_watchdog": {
                 "fresh_verified_versions": active_verified,
