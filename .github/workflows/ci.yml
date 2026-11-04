@@ -18,10 +18,13 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Enable unprivileged user namespaces for Linux Enclave Isolation Test
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
       - name: Build Native AVX2 SIMD Shared Library
         run: make build
 
-      - name: Run Full Vision + Audio Unit & Integration Suite (31 Suites)
+      - name: Run Full Vision + Audio Unit & Integration Suite (33 Suites)
         run: make test
 
       - name: Run Standalone CLI Self-Tests (NO_COLOR + Plain 7-bit ASCII)
