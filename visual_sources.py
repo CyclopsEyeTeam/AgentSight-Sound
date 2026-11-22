@@ -11,13 +11,19 @@ Callers pass absolute paths the Cyclops side has already checked against the cha
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import html
 import io
 import json
 import os
 import shutil
+import selectors
+import signal
+import stat
 import subprocess
 import tempfile
+import time
+import urllib.parse
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
@@ -56,26 +62,97 @@ def classify(path: str) -> str:
     )
 
 
-def _checked_file(path: str, limit: int) -> Path:
-    p = Path(path)
-    if not p.is_absolute():
+def _open_confined(parts: Sequence[str], root_fd: int, *, directory: bool = False) -> int:
+    """Walk a pinned descriptor, rejecting traversal and symlinks at every component."""
+    if any(p in ("", ".", "..") or "/" in p or "\x00" in p for p in parts):
+        raise ValueError("ERR_VISUAL_PATH_TRAVERSAL")
+    parent = os.dup(root_fd)
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, flags | os.O_DIRECTORY, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        if not parts:
+            if directory:
+                return os.dup(parent)
+            raise ValueError("ERR_VISUAL_NOT_A_FILE")
+        return os.open(parts[-1], flags | (os.O_DIRECTORY if directory else 0), dir_fd=parent)
+    finally:
+        os.close(parent)
+
+
+def _absolute_parts(path: str) -> Tuple[str, ...]:
+    if not Path(path).is_absolute():
         raise ValueError("ERR_VISUAL_PATH_NOT_ABSOLUTE: Cyclops passes checked absolute paths only")
-    fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
+    # Inspect raw components before pathlib can normalize away '.' components.
+    parts = tuple(p for p in str(path).split("/") if p)
+    if any(p in (".", "..") or "\x00" in p for p in parts):
+        raise ValueError("ERR_VISUAL_PATH_TRAVERSAL")
+    return parts
+
+
+def _open_absolute(path: str, *, directory: bool = False) -> int:
+    parts = _absolute_parts(path)
+    root_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        return _open_confined(parts, root_fd, directory=directory)
+    finally:
+        os.close(root_fd)
+
+
+@contextmanager
+def _checked_file(path: str, limit: int, *, root_fd: Optional[int] = None):
+    """Keep the checked regular descriptor open; callers never reopen the original path."""
+    fd = (_open_absolute(path) if root_fd is None
+          else _open_confined(str(path).split("/"), root_fd))
     try:
         st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f"ERR_VISUAL_NOT_A_FILE: {Path(path).name}")
+        if st.st_size > limit:
+            raise ValueError(f"ERR_VISUAL_FILE_TOO_LARGE: {Path(path).name} is {st.st_size} bytes (limit {limit})")
+        handle = os.fdopen(fd, "rb")
+        fd = None
+        with handle:
+            yield handle
     finally:
-        os.close(fd)
-    if not (st.st_mode & 0o170000 == 0o100000):
-        raise ValueError(f"ERR_VISUAL_NOT_A_FILE: {p.name}")
-    if st.st_size > limit:
-        raise ValueError(f"ERR_VISUAL_FILE_TOO_LARGE: {p.name} is {st.st_size} bytes (limit {limit})")
-    return p
+        if fd is not None:
+            os.close(fd)
+
+
+def _read_bounded(handle, limit: int) -> bytes:
+    data = handle.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("ERR_VISUAL_FILE_TOO_LARGE: file grew beyond its byte limit")
+    return data
+
+
+@contextmanager
+def _private_snapshot(path: str, limit: int):
+    """Give external decoders one bounded private file, never an unchecked pathname."""
+    with _checked_file(path, limit) as source, tempfile.TemporaryDirectory(prefix="ev-media-") as work:
+        snapshot = Path(work) / ("source" + Path(path).suffix)
+        total = 0
+        with snapshot.open("xb") as target:
+            os.chmod(snapshot, 0o600)
+            while True:
+                chunk = source.read(min(65536, limit + 1 - total))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
+                    raise ValueError("ERR_VISUAL_FILE_TOO_LARGE: file grew beyond its byte limit")
+                target.write(chunk)
+        yield snapshot
 
 
 def load_image(path: str, *, frame: int = 0) -> Image.Image:
     """Decodes an image file (first frame, or `frame` of an animation) as RGBA."""
-    p = _checked_file(path, MAX_FILE_BYTES)
-    with Image.open(p) as img:
+    p = Path(path)
+    with _checked_file(path, MAX_FILE_BYTES) as source:
+        data = _read_bounded(source, MAX_FILE_BYTES)
+    with Image.open(io.BytesIO(data)) as img:
         if img.width * img.height > MAX_SOURCE_PIXELS:
             raise ValueError(f"ERR_VISUAL_TOO_LARGE: {img.width}x{img.height}")
         if frame:
@@ -98,6 +175,50 @@ class _ChromeProfile:
         shutil.rmtree(self.path, ignore_errors=True)
 
 
+def _run_owned(argv: Sequence[str], *, env: dict, timeout: float, max_output: int = 0) -> bytes:
+    """Bound output and wall time; kill the owned session even if its leader exits first."""
+    proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE if max_output else subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    try:
+        if proc.stdout is not None:
+            with selectors.DefaultSelector() as selector:
+                selector.register(proc.stdout, selectors.EVENT_READ)
+                while selector.get_map():
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise subprocess.TimeoutExpired(argv, timeout)
+                    for key, _ in selector.select(left):
+                        chunk = os.read(key.fd, min(65536, max_output + 1 - len(output)))
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                        else:
+                            output.extend(chunk)
+                            if len(output) > max_output:
+                                raise ValueError("ERR_VISUAL_OUTPUT_TOO_LARGE")
+        proc.wait(timeout=max(0.001, deadline - time.monotonic()))
+        if proc.returncode:
+            raise RuntimeError(f"ERR_VISUAL_SUBPROCESS_FAILED: exit {proc.returncode}")
+        return bytes(output)
+    finally:
+        # A successful leader can leave children behind. Never target our own process group.
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(proc.pid, sig)
+            except ProcessLookupError:
+                pass
+        proc.wait()
+        if proc.stdout is not None:
+            proc.stdout.close()
+
+
+def _bounded_dimensions(width: int, height: int) -> None:
+    if width <= 0 or height <= 0 or max(width, height) > 16384 or width * height > MAX_SOURCE_PIXELS:
+        raise ValueError(f"ERR_VISUAL_TOO_LARGE: {width}x{height}")
+
+
 def _chrome_screenshot(
     url: str, width: int, height: int, *, wait_ms: int, transparent: bool, allow_origin: str = ""
 ) -> Image.Image:
@@ -117,13 +238,13 @@ def _chrome_screenshot(
         ]
         env = {"PATH": "/usr/bin:/bin", "HOME": profile, "TMPDIR": profile, "LANG": "C.UTF-8"}
         try:
-            subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=20, check=False)
+            _run_owned(argv, env=env, timeout=20)
         except subprocess.TimeoutExpired:
             raise RuntimeError("ERR_VISUAL_RENDER_TIMEOUT: the page did not finish drawing within 20 s")
         if not os.path.exists(shot):
             raise RuntimeError("ERR_VISUAL_RENDER_FAILED: Chrome produced no picture")
         with Image.open(shot) as img:
+            _bounded_dimensions(img.width, img.height)
             return img.convert("RGBA")
 
 
@@ -171,26 +292,70 @@ def render_svg(svg_text: str) -> Image.Image:
 
 
 def load_svg(path: str) -> Image.Image:
-    p = _checked_file(path, MAX_SVG_TEXT_BYTES)
-    return render_svg(p.read_text(encoding="utf-8", errors="replace"))
+    with _checked_file(path, MAX_SVG_TEXT_BYTES) as source:
+        text = _read_bounded(source, MAX_SVG_TEXT_BYTES).decode("utf-8", errors="replace")
+    return render_svg(text)
 
 
 class _PageServer:
     """A read-only HTTP server for one folder on 127.0.0.1, so a page's JavaScript modules load as on the web."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, root_fd: Optional[int] = None,
+                 page_parts: Optional[Sequence[str]] = None, page_bytes: Optional[bytes] = None) -> None:
         import functools
         import http.server
         import threading
 
+        root_fd = _open_absolute(str(root), directory=True) if root_fd is None else os.dup(root_fd)
+
         class Quiet(http.server.SimpleHTTPRequestHandler):
+            timeout = 3.0
+
             def log_message(self, *_: object) -> None:
                 pass
 
             def do_POST(self) -> None:  # pages may only read
                 self.send_error(405)
 
-        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Quiet, directory=str(root)))
+            def send_head(self):
+                # Walk a pinned root, refusing symlinks at every hop (including indexes).
+                parts = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path).split("/")
+                if any(p in ("..", ".") or "\x00" in p for p in parts):
+                    self.send_error(403)
+                    return None
+                parts = [p for p in parts if p]
+                if not parts or self.path.split("?", 1)[0].endswith("/"):
+                    parts.append("index.html")
+                try:
+                    if page_parts is not None and tuple(parts) == tuple(page_parts):
+                        data = page_bytes
+                        if data is None or len(data) > MAX_FILE_BYTES:
+                            raise ValueError("not a bounded page snapshot")
+                    else:
+                        # Nested HTML/media assets share the pinned page root and byte ceiling.
+                        with _checked_file("/".join(parts), MAX_FILE_BYTES, root_fd=root_fd) as source:
+                            data = _read_bounded(source, MAX_FILE_BYTES)
+                    handle = io.BytesIO(data)
+                    try:
+                        self.send_response(200)
+                        self.send_header("Content-type", self.guess_type(parts[-1]))
+                        self.send_header("Content-Length", str(len(data)))
+                        self.end_headers()
+                    except BaseException:
+                        handle.close()
+                        raise
+                    return handle
+                except (OSError, ValueError):
+                    self.send_error(404)
+                    return None
+
+        try:
+            self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Quiet, directory=str(root)))
+            self.httpd.daemon_threads = False
+        except BaseException:
+            os.close(root_fd)
+            raise
+        self.root_fd = root_fd
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
 
     def __enter__(self) -> str:
@@ -200,6 +365,8 @@ class _PageServer:
     def __exit__(self, *_: object) -> None:
         self.httpd.shutdown()
         self.httpd.server_close()
+        self.thread.join()
+        os.close(self.root_fd)
 
 
 def capture_page(
@@ -209,32 +376,50 @@ def capture_page(
     Screenshots an HTML page (e.g. a play-engine game) after each virtual-time point in `at_ms`.
     The page is served from `root` (default: its own folder) by a private local server.
     """
-    p = _checked_file(path, MAX_FILE_BYTES)
-    folder = Path(root).resolve() if root else p.parent
-    try:
-        rel = p.resolve().relative_to(folder)
-    except ValueError:
+    parts = _absolute_parts(path)
+    folder = Path(root) if root is not None else Path(path).parent
+    root_parts = _absolute_parts(str(folder))
+    if parts[:len(root_parts)] != root_parts or len(parts) <= len(root_parts):
         raise ValueError("ERR_PAGE_OUTSIDE_ROOT: the page is not inside its served folder")
-    width = max(64, min(MAX_PAGE_SIZE[0], int(width)))
-    height = max(64, min(MAX_PAGE_SIZE[1], int(height)))
-    with _PageServer(folder) as origin:
-        url = f"http://{origin}/{rel.as_posix()}" + (f"?{query}" if query else "")
-        return [
-            _chrome_screenshot(url, width, height, wait_ms=max(1, int(t)), transparent=False, allow_origin=origin)
-            for t in at_ms
-        ]
+    rel_parts = parts[len(root_parts):]
+    root_fd = _open_absolute(str(folder), directory=True)
+    try:
+        with _checked_file("/".join(rel_parts), MAX_FILE_BYTES, root_fd=root_fd) as source:
+            page_bytes = _read_bounded(source, MAX_FILE_BYTES)
+        width = max(64, min(MAX_PAGE_SIZE[0], int(width)))
+        height = max(64, min(MAX_PAGE_SIZE[1], int(height)))
+        with _PageServer(folder, root_fd=root_fd, page_parts=rel_parts, page_bytes=page_bytes) as origin:
+            rel = urllib.parse.quote("/".join(rel_parts), safe="/")
+            url = f"http://{origin}/{rel}" + (f"?{query}" if query else "")
+            return [
+                _chrome_screenshot(url, width, height, wait_ms=max(1, int(t)), transparent=False, allow_origin=origin)
+                for t in at_ms
+            ]
+    finally:
+        os.close(root_fd)
+
+
+@contextmanager
+def checked_video(path: str):
+    with _private_snapshot(path, MAX_VIDEO_BYTES) as snapshot:
+        yield snapshot, _video_info_snapshot(snapshot)
 
 
 def video_info(path: str) -> dict:
-    p = _checked_file(path, MAX_VIDEO_BYTES)
-    out = subprocess.run(
+    with checked_video(path) as (_, info):
+        return info
+
+
+def _video_info_snapshot(p: Path) -> dict:
+    output = _run_owned(
         [FFPROBE, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,avg_frame_rate:format=duration",
          "-of", "json", str(p)],
-        env={"PATH": "/usr/bin:/bin"}, capture_output=True, timeout=15, check=False,
+        env={"PATH": "/usr/bin:/bin"}, timeout=15, max_output=65536,
     )
     try:
-        data = json.loads(out.stdout or b"{}")
+        data = json.loads(output or b"{}")
         stream = (data.get("streams") or [{}])[0]
+        _bounded_dimensions(int(stream["width"]), int(stream["height"]))
         num, _, den = str(stream.get("avg_frame_rate", "0/1")).partition("/")
         return {
             "width": int(stream["width"]),
@@ -248,17 +433,26 @@ def video_info(path: str) -> dict:
 
 def video_frames(path: str, times_s: Sequence[float]) -> List[Image.Image]:
     """Decodes one frame at each time (seconds) with ffmpeg, as RGBA."""
-    p = _checked_file(path, MAX_VIDEO_BYTES)
+    with checked_video(path) as (snapshot, _):
+        return _video_frames_snapshot(snapshot, times_s)
+
+
+def _video_frames_snapshot(p: Path, times_s: Sequence[float]) -> List[Image.Image]:
     frames: List[Image.Image] = []
     for t in times_s:
-        out = subprocess.run(
-            [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin", "-ss", f"{max(0.0, float(t)):.3f}", "-i", str(p),
-             "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
-            env={"PATH": "/usr/bin:/bin"}, capture_output=True, timeout=20, check=False,
+        output = _run_owned(
+            [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin", "-threads", "1",
+             "-ss", f"{max(0.0, float(t)):.3f}", "-i", str(p), "-map", "0:v:0",
+             "-frames:v", "1", "-vf", "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease",
+             "-threads", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
+            env={"PATH": "/usr/bin:/bin"}, timeout=20, max_output=16 * 1024 * 1024,
         )
-        if not out.stdout:
+        if not output:
             raise ValueError(f"ERR_VIDEO_FRAME_MISSING: no frame at {t} s in {p.name}")
-        with Image.open(io.BytesIO(out.stdout)) as img:
+        with Image.open(io.BytesIO(output)) as img:
+            _bounded_dimensions(img.width, img.height)
+            if img.width > MAX_PAGE_SIZE[0] or img.height > MAX_PAGE_SIZE[1]:
+                raise ValueError("ERR_VIDEO_DECODE_DIMENSIONS: decoder exceeded scaled bounds")
             frames.append(img.convert("RGBA"))
     return frames
 
@@ -349,9 +543,10 @@ def colour_name(rgb: Tuple[int, int, int]) -> str:
     return min(_NAMED, key=lambda n: sum((a - b) ** 2 for a, b in zip(rgb, n[1])))[0]
 
 
-def component_colours(png_bytes: bytes, components: Sequence[dict], *, per_component: int = 2) -> List[dict]:
-    """The main colours of each connected component (inside its box, opaque pixels only): hex, plain name and share."""
-    img = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+def component_colours(img: Image.Image, components: Sequence[dict], *, per_component: int = 2) -> List[dict]:
+    """Sample native RGBA boxes, never a downscaled/composited presentation PNG."""
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
     out = []
     for comp in components:
         box = comp.get("bbox") or {}
@@ -359,9 +554,12 @@ def component_colours(png_bytes: bytes, components: Sequence[dict], *, per_compo
             x0, y0, x1, y1 = int(box["x_min"]), int(box["y_min"]), int(box["x_max"]) + 1, int(box["y_max"]) + 1
         except (KeyError, TypeError, ValueError):
             continue
+        x0, y0, x1, y1 = max(0, x0), max(0, y0), min(img.width, x1), min(img.height, y1)
+        if x1 <= x0 or y1 <= y0:
+            continue
         counts: dict = {}
         for r, g, b, a in img.crop((x0, y0, x1, y1)).getdata():
-            if a >= 128:
+            if a > 0:
                 key = ((r >> 4) << 4 | 8, (g >> 4) << 4 | 8, (b >> 4) << 4 | 8)
                 counts[key] = counts.get(key, 0) + 1
         total = sum(counts.values())

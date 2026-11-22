@@ -41,6 +41,7 @@ Scope:
 
 from __future__ import annotations
 
+from ev_child_guard import die_with_parent
 import copy
 import ctypes
 import hashlib
@@ -82,6 +83,8 @@ from exec_gate_daemons import (
     OutOfProcessVaultGateDaemon,
     _extract_so_peercred,
     _recv_framed_json,
+    _recv_rpc_request,
+    _isolated_ipc_connection,
     _send_framed_json,
 )
 
@@ -258,6 +261,7 @@ def _hsm_kms_enclave_loop(
     Raw key bytes are never exported over IPC; callers can only invoke
     pkcs11_sign, pkcs11_verify, rotate_key_epoch, or emergency_zeroize_keys.
     """
+    die_with_parent()
     hardening_status = apply_os_process_hardening()
     key_epoch = 1
     max_signatures_per_epoch = 10000
@@ -300,11 +304,13 @@ def _hsm_kms_enclave_loop(
     try:
         while True:
             conn, _ = server.accept()
-            with conn:
-                req = _recv_framed_json(conn)
+            with _isolated_ipc_connection(conn):
+                req = _recv_rpc_request(conn)
                 if not req:
                     continue
                 method = req.get("method", "")
+                # SO_PEERCRED authenticates the authorized Unix UID/GID. This role
+                # is only a caller-supplied label inside that boundary, not separate authentication.
                 principal = req.get("caller_principal", "")
                 params = req.get("params", {})
 
@@ -577,6 +583,28 @@ class OutOfProcessHsmKmsClient:
 # PROD-GATE-2: Native C11/AVX2 + Rust SIMD Operator Engine & Differential Fuzzer
 # =============================================================================
 
+# The shipped binary is built with -mavx2 from prod_gate_native_simd.c; any other bytes are refused.
+# Same rounded transfer table as the integer native engine (scale 1e-6).
+SRGB_LINEAR_U6 = tuple(int(((v / 255 / 12.92) if v / 255 <= 0.04045 else
+                          ((v / 255 + 0.055) / 1.055) ** 2.4) * 1_000_000 + 0.5)
+                       for v in range(256))
+
+TRUSTED_SIMD_LIBRARY_SHA256 = frozenset({
+    "db5725b53a6548bc20bc4f4691a672e646e817161489e39b43a5a0f9b385bee7",
+})
+
+
+def _cpu_has_avx2() -> bool:
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if line.startswith("flags"):
+                    return "avx2" in line.split(":", 1)[1].split()
+    except OSError:
+        return False
+    return False
+
+
 class NativeSimdOperatorEngine:
     """
     PROD-GATE-2 Native SIMD Closed-Form Operator Wrapper (libprod_gate_simd.so).
@@ -589,6 +617,15 @@ class NativeSimdOperatorEngine:
         if so_path is None:
             so_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libprod_gate_simd.so")
         self.so_path = so_path
+        with open(so_path, "rb") as handle:
+            so_digest = hashlib.sha256(handle.read()).hexdigest()
+        if so_digest not in TRUSTED_SIMD_LIBRARY_SHA256:
+            raise RuntimeError(
+                f"libprod_gate_simd.so does not match the shipped build (sha256 {so_digest[:16]}...); "
+                "rebuild from prod_gate_native_simd.c and update TRUSTED_SIMD_LIBRARY_SHA256"
+            )
+        if not _cpu_has_avx2():
+            raise RuntimeError("this CPU lacks AVX2, which the shipped libprod_gate_simd.so requires")
         self._lib = ctypes.CDLL(so_path)
         self.active_backend = "native_avx2_simd"
         self.fallback_triggered = False
@@ -739,6 +776,13 @@ class NativeSimdOperatorEngine:
         n_runs = int(
             self._lib.ee_extract_fg_runs(rgba_a, byte_len, width, height, fg_runs_buf, max_runs)
         )
+        if n_runs > max_runs:
+            # The C side counts every run even when the buffer is full; size it exactly and re-read.
+            max_runs = n_runs
+            fg_runs_buf = (ctypes.c_int32 * (max_runs * 3))()
+            n_runs = int(
+                self._lib.ee_extract_fg_runs(rgba_a, byte_len, width, height, fg_runs_buf, max_runs)
+            )
         used_runs = min(n_runs, max_runs)
         runs_list: List[Tuple[int, int, int]] = [
             (int(fg_runs_buf[i * 3]), int(fg_runs_buf[i * 3 + 1]), int(fg_runs_buf[i * 3 + 2]))
@@ -808,6 +852,72 @@ class NativeSimdOperatorEngine:
             "op_alpha_coverage_q16": int(bbox_nt[5]),
         }
 
+    def run_fast_signal_operators_native(
+        self,
+        rgba_curr: bytes,
+        rgba_prev: Optional[bytes],
+        width: int,
+        height: int,
+        *,
+        tolerance: int = 0,
+    ) -> Dict[str, Any]:
+        """
+        Lightweight native AVX2 signal operator pass for the Active Electric Signal Temp Buffer.
+        Computes bit-exact `dhash64`, `op_sobel_edge_density_q16`, `op_mean_rgba_u8`, and
+        (when `rgba_prev` is provided) `op_bbox_aligned_diff_u8` in ~0.2 ms without running
+        4-connected-component flood-fills or 128x128 proxy mark translation.
+        """
+        total_px = width * height
+        byte_len = len(rgba_curr)
+
+        stats_arr = (ctypes.c_uint64 * 8)()
+        rc = self._lib.ee_op_mean_rgba_u8(rgba_curr, byte_len, width, height, stats_arr)
+        if rc != 0:
+            raise ValueError(f"ee_op_mean_rgba_u8 failed: {rc}")
+
+        edge_q16 = ctypes.c_uint64(0)
+        dhash64 = ctypes.c_uint64(0)
+        rc = self._lib.ee_op_sobel_and_dhash64(
+            rgba_curr, byte_len, width, height, ctypes.byref(edge_q16), ctypes.byref(dhash64)
+        )
+        if rc != 0:
+            raise ValueError(f"ee_op_sobel_and_dhash64 failed: {rc}")
+
+        diff_dict: Optional[Dict[str, Any]] = None
+        if rgba_prev is not None:
+            diff_out = (ctypes.c_int64 * 8)()
+            rc = self._lib.ee_op_diff_rgba_u8(
+                rgba_prev, rgba_curr, byte_len, width, height, tolerance, diff_out
+            )
+            if rc != 0:
+                raise ValueError(f"ee_op_diff_rgba_u8 failed: {rc}")
+            changed_px = int(diff_out[0])
+            diff_dict = {
+                "changed_pixels": changed_px,
+                "unchanged_pixels": total_px - changed_px,
+                "added_pixels": int(diff_out[1]),
+                "removed_pixels": int(diff_out[2]),
+                "modified_colour_pixels": int(diff_out[3]),
+                "total_pixels": total_px,
+                "change_ratio": round(changed_px / total_px, 6),
+                "diff_bbox": [
+                    int(diff_out[4]),
+                    int(diff_out[5]),
+                    int(diff_out[6]),
+                    int(diff_out[7]),
+                ],
+            }
+
+        return {
+            "op_mean_rgba_u8": {
+                "sum_rgba": [int(stats_arr[0]), int(stats_arr[1]), int(stats_arr[2]), int(stats_arr[3])],
+                "mean_rgba_q16": [int(stats_arr[4]), int(stats_arr[5]), int(stats_arr[6]), int(stats_arr[7])],
+            },
+            "op_sobel_edge_density_q16": int(edge_q16.value),
+            "op_perceptual_hash_dhash64": f"0x{int(dhash64.value):016x}",
+            "op_bbox_aligned_diff_u8": diff_dict,
+        }
+
     @staticmethod
     def run_reference_python_bbox_and_diff(
         rgba_a: bytes,
@@ -822,6 +932,7 @@ class NativeSimdOperatorEngine:
         sr = sg = sb = sa = 0
         min_y = 255
         max_y = 0
+        min_linear, max_linear = 10_000_000_000, 0
         hist16 = [0] * 16
         non_transparent = 0
         x_min_nt, y_min_nt = width, height
@@ -846,6 +957,9 @@ class NativeSimdOperatorEngine:
                     min_y = luma
                 if luma > max_y:
                     max_y = luma
+                linear = 2126 * SRGB_LINEAR_U6[r] + 7152 * SRGB_LINEAR_U6[g] + 722 * SRGB_LINEAR_U6[b]
+                min_linear = min(min_linear, linear)
+                max_linear = max(max_linear, linear)
                 hist16[(luma >> 4) & 0xF] += 1
                 if a > 0:
                     non_transparent += 1
@@ -934,7 +1048,7 @@ class NativeSimdOperatorEngine:
             ],
             "min_luma_u8": min_y,
             "max_luma_u8": max_y,
-            "wcag_q16": ((max_y + 13) << 16) // (min_y + 13),
+            "wcag_q16": ((max_linear + 500_000_000) << 16) // (min_linear + 500_000_000),
             "hist16": hist16,
             "foreground_bbox": bbox_dict,
             "matching_colour_px": matched_cm,
@@ -2324,7 +2438,7 @@ if __name__ == "__main__":
     )
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(out_report, f, indent=2, sort_keys=True)
-    scratch_dir = os.environ.get("ELECTRIC_SIGHT_SCRATCH_DIR", "")
+    scratch_dir = os.environ.get("ELECTRIC_VISION_SCRATCH_DIR", "")
     if scratch_dir and os.path.isdir(scratch_dir):
         shutil.copy2(out_path, os.path.join(scratch_dir, "prod_gate_verification_report.json"))
     print(json.dumps(out_report["metrics"], indent=2))

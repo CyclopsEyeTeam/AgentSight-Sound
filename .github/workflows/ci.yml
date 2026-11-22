@@ -18,13 +18,21 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install system media & test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          python3 -m pip install --upgrade pip Pillow python-xlib
+
       - name: Enable unprivileged user namespaces for Linux Enclave Isolation Test
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 
-      - name: Build Native AVX2 SIMD Shared Library
-        run: make build
+      - name: Verify Native AVX2 SIMD Shared Library & C11 Compilation
+        run: |
+          make build
+          make verify-c-compile
 
-      - name: Run Full Vision + Audio Unit & Integration Suite (33 Suites)
+      - name: Run Full Vision + Audio Unit & Integration Suite
         run: make test
 
       - name: Run Standalone CLI Self-Tests (NO_COLOR + Plain 7-bit ASCII)

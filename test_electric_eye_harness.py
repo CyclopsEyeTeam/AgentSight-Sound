@@ -1133,9 +1133,10 @@ class TestElectricEyeFixtureHarness(unittest.TestCase):
             assert_no_raw_buffer_leakage(t6)
 
     def test_owner_supplied_picture_is_accepted_and_live_capture_still_refused(self) -> None:
-        """On the owner's word (2026-10-30 & 2026-11-04): a picture the owner sends to remake or enhance is accepted under the
-        honest origin 'owner_supplied_picture', and the Companion's own desktop glance is accepted under
-        'companion_desktop_glance' (including via ContinuousElectricEyeStream.ingest_frame(origin_attestation=...));
+        """On the owner's word (2026-10-30, 2026-11-04 & 2026-11-16): a picture the owner sends to remake or enhance is accepted under the
+        honest origin 'owner_supplied_picture', the Companion's own desktop glance is accepted under
+        'companion_desktop_glance', and Electric Browser's in-memory viewport frame is accepted under
+        'electric_browser_frame' (including via ContinuousElectricEyeStream.ingest_frame(origin_attestation=...));
         every other non-synthetic origin, live webcam or generic screen capture above all, stays refused."""
         import shutil
         import tempfile
@@ -1150,6 +1151,9 @@ class TestElectricEyeFixtureHarness(unittest.TestCase):
             glance_ok = session.register_synthetic_canvas("src_gate_one", "v2", marks, width=512, height=512,
                                                           source_kind="image_bytes", origin_attestation="companion_desktop_glance")
             self.assertEqual(glance_ok["origin_attestation"], "companion_desktop_glance")
+            browser_ok = session.register_synthetic_canvas("src_gate_one", "v3", marks, width=512, height=512,
+                                                           source_kind="captured_frame", origin_attestation="electric_browser_frame")
+            self.assertEqual(browser_ok["origin_attestation"], "electric_browser_frame")
             stream = session.create_continuous_stream("src_companion_glance", width=128, height=128, max_window_frames=4)
             rgba_128 = bytes([20, 60, 30, 255]) * (128 * 128)
             ingested = stream.ingest_frame(
@@ -1160,9 +1164,166 @@ class TestElectricEyeFixtureHarness(unittest.TestCase):
                 origin_attestation="companion_desktop_glance",
             )
             self.assertEqual(ingested["tick"], 1)
-            for n, origin in enumerate(("live_webcam_capture", "live_screen_capture", "screen_capture", "anything_else"), 3):
+            eb_stream = session.create_continuous_stream("src_eb_frame", width=128, height=128, max_window_frames=4)
+            eb_ingested = eb_stream.ingest_frame(
+                "v1",
+                [],
+                rgba=rgba_128,
+                origin={"kind": "electric_browser_frame"},
+                origin_attestation="electric_browser_frame",
+            )
+            self.assertEqual(eb_ingested["tick"], 1)
+            for n, origin in enumerate(("live_webcam_capture", "live_screen_capture", "screen_capture", "anything_else"), 4):
                 with self.subTest(origin=origin), self.assertRaisesRegex(PermissionError, "ERR_NON_SYNTHETIC_INPUT_PROHIBITED"):
                     session.register_synthetic_canvas("src_gate_one", f"v{n}", marks, width=512, height=512, origin_attestation=origin)
+
+    def test_quarantine_allowlist_accepts_electric_browser_frame_and_preserves_eviction_and_refusals(self) -> None:
+        """Directly verifies EXEC-GATE-3 zero-PII quarantine allowlist ('synthetic_fixture',
+        'owner_supplied_picture', 'companion_desktop_glance', 'electric_browser_frame'),
+        SOURCE_ID_REGEX / long-digit / prohibited-token enforcement, refusal of generic live capture
+        with ERR_NON_SYNTHETIC_INPUT_PROHIBITED, and explicit_bzero ring-buffer eviction."""
+        from contextlib import ExitStack
+        import hashlib
+        import socket
+        import struct
+        from unittest.mock import Mock, patch
+        import exec_gate_daemons as gates
+        import electric_vision_agent_bridge as bridge
+
+        class _FakeConn:
+            def __init__(self, request: dict) -> None:
+                self.request = request
+                self.responses: list = []
+
+            def __enter__(self) -> "_FakeConn":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                pass
+
+            def settimeout(self, timeout: float) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+            def getsockopt(self, level: int, option: int, size: int) -> bytes:
+                assert (level, option, size) == (socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+                return struct.pack("3i", 101, 42, 43)
+
+        digest16 = hashlib.sha256(b"electric-browser:v0:d_99887766").digest()[:16]
+        eb_doc_sid = "src_eb_" + "".join(chr(ord("a") + ((b >> 4) & 0xF)) + chr(ord("a") + (b & 0xF)) for b in digest16)
+
+        allowed = (
+            ("src_eb_frame", "synthetic_fixture"),
+            ("src_eb_frame", "owner_supplied_picture"),
+            ("src_eb_frame", "companion_desktop_glance"),
+            ("src_eb_frame", "electric_browser_frame"),
+            (eb_doc_sid, "electric_browser_frame"),
+        )
+        refused_live = (
+            "live_webcam_capture",
+            "live_screen_capture",
+            "screen_capture",
+            "anything_else",
+        )
+        bad_ids = (
+            ("bad-id", "ERR_INVALID_SOURCE_ID"),
+            ("src_UpperCase", "ERR_INVALID_SOURCE_ID"),
+            ("src_eb_123456", "ERR_UNSAFE_SEMANTIC_OR_PII_SOURCE_ID"),
+            ("src_user_frame", "ERR_UNSAFE_SEMANTIC_OR_PII_SOURCE_ID"),
+        )
+        requests: list[_FakeConn] = []
+        for idx, (sid, origin) in enumerate(allowed, 1):
+            requests.append(_FakeConn({
+                "method": "inspect_source",
+                "params": {
+                    "source_id": sid,
+                    "source_version": f"v{idx}",
+                    "source_kind": "captured_frame",
+                    "marks": [{"mark_id": "m1"}],
+                    "origin_attestation": origin,
+                },
+            }))
+        for idx, origin in enumerate(refused_live, 10):
+            requests.append(_FakeConn({
+                "method": "inspect_source",
+                "params": {
+                    "source_id": "src_eb_frame",
+                    "source_version": f"v{idx}",
+                    "source_kind": "captured_frame",
+                    "marks": [{"mark_id": "m1"}],
+                    "origin_attestation": origin,
+                },
+            }))
+        for idx, (sid, _expected_err) in enumerate(bad_ids, 20):
+            requests.append(_FakeConn({
+                "method": "inspect_source",
+                "params": {
+                    "source_id": sid,
+                    "source_version": f"v{idx}",
+                    "source_kind": "captured_frame",
+                    "marks": [{"mark_id": "m1"}],
+                    "origin_attestation": "electric_browser_frame",
+                },
+            }))
+        requests.append(_FakeConn({
+            "method": "inspect_source",
+            "params": {
+                "source_id": "src_eb_frame",
+                "source_version": "v30",
+                "source_kind": "captured_frame",
+                "marks": [{"mark_id": "user_avatar"}],
+                "origin_attestation": "electric_browser_frame",
+            },
+        }))
+        requests.append(_FakeConn({"method": "get_status"}))
+        requests.append(_FakeConn({"method": "shutdown"}))
+
+        server = Mock()
+        server.accept.side_effect = [(c, None) for c in requests]
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(gates.socket, "socket", return_value=server))
+            stack.enter_context(patch.object(gates, "die_with_parent"))
+            stack.enter_context(patch.object(gates.os.path, "exists", return_value=False))
+            stack.enter_context(patch.object(gates.os, "chmod"))
+            stack.enter_context(patch.object(gates, "_recv_framed_json", side_effect=lambda c: c.request))
+            if hasattr(gates, "_recv_rpc_request"):
+                stack.enter_context(patch.object(gates, "_recv_rpc_request", side_effect=lambda c: c.request))
+            stack.enter_context(patch.object(gates, "_send_framed_json", side_effect=lambda c, p: c.responses.append(p)))
+            gates._quarantine_and_kill_switch_daemon_loop("/fake/q", "/fake/evidence", None, None, 42, 43, Mock())
+
+        for idx, (_sid, origin) in enumerate(allowed):
+            resp = requests[idx].responses[0]
+            self.assertEqual(resp["status"], "ok", origin)
+            self.assertEqual(resp["result"]["quarantine_status"], "passed_zero_pii_synthetic_check")
+        offset = len(allowed)
+        for idx, origin in enumerate(refused_live):
+            resp = requests[offset + idx].responses[0]
+            self.assertEqual(resp["status"], "error", origin)
+            self.assertIn("ERR_NON_SYNTHETIC_INPUT_PROHIBITED", resp["reason"])
+        offset += len(refused_live)
+        for idx, (_sid, expected_err) in enumerate(bad_ids):
+            resp = requests[offset + idx].responses[0]
+            self.assertEqual(resp["status"], "error", expected_err)
+            self.assertIn(expected_err, resp["reason"])
+        pii_mark_resp = requests[offset + len(bad_ids)].responses[0]
+        self.assertEqual(pii_mark_resp["status"], "error")
+        self.assertIn("ERR_QUARANTINE_MARK_ID_REJECTED", pii_mark_resp["reason"])
+
+        status = requests[-2].responses[0]["result"]
+        self.assertEqual(status["quarantine_passed_count"], len(allowed))
+        self.assertEqual(status["quarantine_rejected_count"], len(refused_live) + len(bad_ids) + 1)
+
+        vault = bridge._create_multi_res_closure_vault(Mock())
+        vault["register_rgba"](eb_doc_sid, "v1", 128, 128, bytes([12, 34, 56, 255]) * (128 * 128))
+        evicted = vault["evict_source"]((eb_doc_sid, "v1"))
+        self.assertTrue(evicted["evicted"])
+        self.assertEqual(evicted["zeroized_bytes"], 128 * 128 * 4)
+        sample_buf = bytearray(b"electric-browser-frame-bytes")
+        wiped = bridge.explicit_zeroize_bytearray(sample_buf)
+        self.assertEqual(wiped, len(sample_buf))
+        self.assertEqual(sample_buf, bytearray(len(sample_buf)))
 
     def test_component_box_of_a_region_wholly_beyond_128_pixels(self) -> None:
         """The native components (prod_gate_enclave) run _connected_components_from_runs at full resolution: a region wholly

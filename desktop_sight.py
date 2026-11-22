@@ -76,10 +76,15 @@ def _movement(ratio: Optional[float]) -> str:
 class DesktopSight:
     """A long-lived companion eye. glance() is cheap (well under a second)."""
 
-    def __init__(self, window: int = 8) -> None:
+    def __init__(self, window: int = 8, *, lightweight: bool = False) -> None:
         self._run = tempfile.mkdtemp(prefix="cee-", dir="/tmp")
         os.chmod(self._run, 0o700)
-        self._session = ElectricVisionAgentSession(run_dir=self._run, default_resolution=SIZE)
+        self._lightweight = bool(lightweight)
+        self._session = ElectricVisionAgentSession(
+            run_dir=self._run,
+            default_resolution=SIZE,
+            lazy_enclave=self._lightweight,
+        )
         self._session.__enter__()
         self._stream = self._session.create_continuous_stream("src_companion_glance", width=SIZE[0], height=SIZE[1], max_window_frames=window)
         self._tick = 0

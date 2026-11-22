@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "electric-sight-and-sound"
-version = "1.0.0"
-description = "Deterministic, zero-leakage Electric Sight & Chargeable-Byte Sound perception enclave for AI agents."
+version = "1.1.0"
+description = "Deterministic, zero-leakage Electric Sight & Chargeable-Byte Sound perception enclave for AI agents — with C11/AVX2 SIMD operators, Active Signal Temp Buffering, XComposite window capture, Continuous Ear, Watch-Together fusion, and MCP servers."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
@@ -18,6 +18,7 @@ keywords = [
     "multimodal-fusion",
     "epistemic-hygiene",
     "simd",
+    "mcp",
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -33,15 +34,30 @@ classifiers = [
     "Topic :: Multimedia :: Sound/Audio :: Analysis",
     "Topic :: Multimedia :: Graphics",
 ]
-dependencies = []
+dependencies = [
+    "Pillow>=10.0.0",
+]
+
+[project.optional-dependencies]
+x11 = ["python-xlib>=0.33"]
 
 [tool.setuptools]
 py-modules = [
-    "electric_eye_harness",
-    "exec_gate_daemons",
-    "prod_gate_enclave",
-    "electric_vision_agent_bridge",
-    "electric_vision_cli",
+    "continuous_vision",
+    "desktop_ear",
+    "desktop_sight",
     "electric_audio_agent_bridge",
     "electric_audio_cli",
+    "electric_eye_harness",
+    "electric_sight_ear_mcp",
+    "electric_vision_agent_bridge",
+    "electric_vision_cli",
+    "electric_vision_mcp",
+    "ev_child_guard",
+    "exec_gate_daemons",
+    "prod_gate_enclave",
+    "signal_buffer",
+    "visual_sources",
+    "watch_together",
+    "x11_window_capture",
 ]

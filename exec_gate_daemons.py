@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from ev_child_guard import die_with_parent
 import copy
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -80,6 +81,25 @@ from electric_eye_harness import (
 # =============================================================================
 
 MAX_IPC_FRAME_BYTES = 4 * 1024 * 1024  # 4 MiB hard frame ceiling
+IPC_REQUEST_TIMEOUT_S = 2.0
+MAX_RPC_NONCES = 65536
+MAX_RPC_NONCE_CHARS = 256
+MAX_CAPABILITY_RECORDS = 4096
+MAX_AUDIT_ENTRY_BYTES = 64 * 1024
+MAX_AUDIT_PAGE_BYTES = 512 * 1024
+MAX_AUDIT_PAGE_ENTRIES = 256
+
+
+@contextmanager
+def _isolated_ipc_connection(conn: socket.socket):
+    """One malformed/slow/disconnected client cannot terminate the accept loop."""
+    with conn:
+        conn.settimeout(IPC_REQUEST_TIMEOUT_S)
+        try:
+            yield conn
+        except (OSError, EOFError, ValueError, TypeError, KeyError, RecursionError):
+            # Includes failures while sending the error response to a departed client.
+            pass
 
 
 def _send_framed_json(sock: socket.socket, payload: Dict[str, Any]) -> None:
@@ -90,23 +110,46 @@ def _send_framed_json(sock: socket.socket, payload: Dict[str, Any]) -> None:
     sock.sendall(header + raw)
 
 
-def _recv_exact(sock: socket.socket, n_bytes: int) -> bytes:
+def _recv_exact(sock: socket.socket, n_bytes: int, *, deadline: Optional[float] = None) -> bytes:
     buf = bytearray()
-    while len(buf) < n_bytes:
-        chunk = sock.recv(n_bytes - len(buf))
-        if not chunk:
-            raise EOFError("Unexpected EOF on AF_UNIX IPC socket.")
-        buf.extend(chunk)
-    return bytes(buf)
+    original_timeout = sock.gettimeout()
+    try:
+        while len(buf) < n_bytes:
+            if deadline is not None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError("ERR_IPC_REQUEST_DEADLINE")
+                sock.settimeout(min(left, original_timeout) if original_timeout is not None else left)
+            chunk = sock.recv(n_bytes - len(buf))
+            if not chunk:
+                raise EOFError("Unexpected EOF on AF_UNIX IPC socket.")
+            buf.extend(chunk)
+        return bytes(buf)
+    finally:
+        sock.settimeout(original_timeout)
 
 
 def _recv_framed_json(sock: socket.socket) -> Dict[str, Any]:
-    header = _recv_exact(sock, 4)
+    timeout = sock.gettimeout()
+    deadline = time.monotonic() + (timeout if timeout is not None else IPC_REQUEST_TIMEOUT_S)
+    header = _recv_exact(sock, 4, deadline=deadline)
     (frame_len,) = struct.unpack(">I", header)
     if frame_len <= 0 or frame_len > MAX_IPC_FRAME_BYTES:
         raise ValueError(f"ERR_INVALID_IPC_FRAME_LENGTH: {frame_len}")
-    raw = _recv_exact(sock, frame_len)
-    return json.loads(raw.decode("utf-8"))
+    raw = _recv_exact(sock, frame_len, deadline=deadline)
+    value = json.loads(raw.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("ERR_IPC_EXPECTED_OBJECT")
+    return value
+
+
+def _recv_rpc_request(sock: socket.socket) -> Dict[str, Any]:
+    req = _recv_framed_json(sock)
+    if not isinstance(req.get("method"), str) or not isinstance(req.get("params", {}), dict):
+        raise ValueError("ERR_IPC_INVALID_REQUEST_SHAPE")
+    if "caller_principal" in req and not isinstance(req["caller_principal"], str):
+        raise ValueError("ERR_IPC_INVALID_PRINCIPAL_SHAPE")
+    return req
 
 
 def _extract_so_peercred(conn: socket.socket) -> Tuple[int, int, int]:
@@ -180,10 +223,11 @@ def _vault_gate_daemon_loop(
     source_registry: Dict[Tuple[str, str], Dict[str, Any]] = {}
     issued_capability_tokens: Dict[str, Dict[str, Any]] = {}
     consumed_capability_tokens: Set[str] = set()
-    used_rpc_nonces: Set[str] = set()
+    used_rpc_nonces: Set[bytes] = set()
     issued_receipts: Dict[str, Dict[str, Any]] = {}
     cc_cache: Dict[Tuple[str, str, int], List[Dict[str, Any]]] = {}
-    peer_auth_records: List[Dict[str, int]] = []
+    verified_peer_connections = 0
+    last_peer_cred = None
     rejected_peer_attempts = 0
     replay_blocks = 0
     unauthorized_issuer_blocks = 0
@@ -222,18 +266,16 @@ def _vault_gate_daemon_loop(
     try:
         while running:
             conn, _ = server.accept()
-            with conn:
+            with _isolated_ipc_connection(conn):
                 try:
                     peer_pid, peer_uid, peer_gid = _extract_so_peercred(conn)
-                    req = _recv_framed_json(conn)
+                    req = _recv_rpc_request(conn)
                 except Exception as exc:
                     _send_framed_json(conn, {"status": "error", "error_code": "ERR_IPC_READ", "reason": str(exc)})
                     continue
 
-                # Simulated peer override for negative testing of SO_PEERCRED enforcement
-                effective_uid = int(req.get("_simulate_peer_uid", peer_uid))
-                effective_gid = int(req.get("_simulate_peer_gid", peer_gid))
-                if effective_uid != allowed_uid or effective_gid != allowed_gid:
+                # Only kernel credentials authenticate the caller; payload fields have no authority.
+                if peer_uid != allowed_uid or peer_gid != allowed_gid:
                     rejected_peer_attempts += 1
                     _send_framed_json(
                         conn,
@@ -241,14 +283,15 @@ def _vault_gate_daemon_loop(
                             "status": "error",
                             "error_code": "ERR_PEER_AUTH_FAILED",
                             "reason": (
-                                f"SO_PEERCRED uid={effective_uid}/gid={effective_gid} "
+                                f"SO_PEERCRED uid={peer_uid}/gid={peer_gid} "
                                 f"does not match allowed uid={allowed_uid}/gid={allowed_gid}."
                             ),
                         },
                     )
                     continue
 
-                peer_auth_records.append({"pid": peer_pid, "uid": peer_uid, "gid": peer_gid})
+                verified_peer_connections += 1
+                last_peer_cred = {"pid": peer_pid, "uid": peer_uid, "gid": peer_gid}
 
                 method = req.get("method")
                 rpc_nonce = req.get("rpc_nonce")
@@ -271,7 +314,7 @@ def _vault_gate_daemon_loop(
                     continue
 
                 # Replay protection on rpc_nonce
-                if not isinstance(rpc_nonce, str) or len(rpc_nonce) < 8:
+                if not isinstance(rpc_nonce, str) or not 8 <= len(rpc_nonce) <= MAX_RPC_NONCE_CHARS:
                     _send_framed_json(
                         conn,
                         {
@@ -281,7 +324,8 @@ def _vault_gate_daemon_loop(
                         },
                     )
                     continue
-                if rpc_nonce in used_rpc_nonces:
+                nonce_digest = hashlib.sha256(rpc_nonce.encode("utf-8")).digest()
+                if nonce_digest in used_rpc_nonces:
                     replay_blocks += 1
                     _send_framed_json(
                         conn,
@@ -292,7 +336,16 @@ def _vault_gate_daemon_loop(
                         },
                     )
                     continue
-                used_rpc_nonces.add(rpc_nonce)
+                if len(used_rpc_nonces) >= MAX_RPC_NONCES:
+                    # Never evict a replay tombstone. Safe, idempotent halt remains available.
+                    if method == "emergency_lock_vault":
+                        emergency_locked = True
+                        _send_framed_json(conn, {"status": "ok", "result": {"emergency_locked": True}})
+                    else:
+                        _send_framed_json(conn, {"status": "error", "error_code": "ERR_RPC_NONCE_CAPACITY",
+                                                 "reason": "Replay guard full; restart the session, not the replay window."})
+                    continue
+                used_rpc_nonces.add(nonce_digest)
 
                 if emergency_locked and method != "ping_status":
                     _send_framed_json(
@@ -314,8 +367,10 @@ def _vault_gate_daemon_loop(
                             "boundary_mode": "out_of_process_af_unix_daemon",
                             "claims_real_process_isolation": True,
                             "so_peercred_enforced": True,
-                            "verified_peer_connections": len(peer_auth_records),
-                            "last_peer_cred": peer_auth_records[-1] if peer_auth_records else None,
+                            "verified_peer_connections": verified_peer_connections,
+                            "last_peer_cred": last_peer_cred,
+                            "nonce_records": len(used_rpc_nonces),
+                            "nonce_capacity": MAX_RPC_NONCES,
                             "rejected_peer_attempts": rejected_peer_attempts,
                             "replay_blocks": replay_blocks,
                             "unauthorized_issuer_blocks": unauthorized_issuer_blocks,
@@ -359,11 +414,19 @@ def _vault_gate_daemon_loop(
 
                     elif method == "evict_sources":
                         keys = [(str(k[0]), str(k[1])) for k in params.get("sources", [])][:4096]
-                        dropped = evict_surfaces(keys)
+                        retired = set(keys)
                         for key in keys:
                             source_registry.pop(key, None)
-                        for cc_key in [k for k in cc_cache if (k[0], k[1]) in set(keys)]:
+                        for receipt in issued_receipts.values():
+                            if (receipt["captured_source_id"], receipt["captured_source_version"]) in retired:
+                                receipt["revoked"] = True
+                        for token_id, token in list(issued_capability_tokens.items()):
+                            if (token["captured_source_id"], token["captured_source_version"]) in retired:
+                                consumed_capability_tokens.add(token_id)
+                                issued_capability_tokens.pop(token_id)
+                        for cc_key in [k for k in cc_cache if (k[0], k[1]) in retired]:
                             cc_cache.pop(cc_key, None)
+                        dropped = evict_surfaces(keys)
                         _send_framed_json(conn, {"status": "ok", "result": {"evicted": dropped}})
 
                     elif method == "store_ghost_pixels":
@@ -791,6 +854,10 @@ def _vault_gate_daemon_loop(
                             raise PermissionError(
                                 "ERR_UNVERIFIED_OBSERVATION_CLAIM: Capability token requires registered captured_frame."
                             )
+                        if not isinstance(render_id, str) or len(render_id) > 256:
+                            raise ValueError("ERR_CAPABILITY_RENDER_ID")
+                        if len(issued_capability_tokens) + len(consumed_capability_tokens) >= MAX_CAPABILITY_RECORDS:
+                            raise PermissionError("ERR_CAPABILITY_CAPACITY: session issuance limit reached")
                         token_id = "cap_tok_" + secrets.token_hex(16)
                         issued_capability_tokens[token_id] = {
                             "token_id": token_id,
@@ -854,8 +921,13 @@ def _vault_gate_daemon_loop(
                                 "ERR_UNVERIFIED_OBSERVATION_CLAIM: Render provenance_refs do not bind to captured_frame."
                             )
 
-                        # Consume single-use token
+                        if not isinstance(rcpt_id, str) or len(rcpt_id) > 256:
+                            raise ValueError("ERR_RECEIPT_ID")
+                        if rcpt_id in issued_receipts or len(issued_receipts) >= MAX_CAPABILITY_RECORDS:
+                            raise PermissionError("ERR_RECEIPT_CAPACITY_OR_DUPLICATE")
+                        # Retain bounded replay tombstones; never reuse an issued capability.
                         consumed_capability_tokens.add(cap_tok)
+                        issued_capability_tokens.pop(cap_tok)
                         stage = "verified_observation_window"
                         sig = sign_receipt(rcpt_id, render["render_id"], sid, sver, stage)
                         receipt = {
@@ -884,6 +956,8 @@ def _vault_gate_daemon_loop(
                         valid = bool(
                             sig_ok
                             and stored is not None
+                            and not stored.get("revoked", False)
+                            and (stored["captured_source_id"], stored["captured_source_version"]) in source_registry
                             and stored["receipt_signature"] == rcpt.get("receipt_signature")
                         )
                         _send_framed_json(conn, {"status": "ok", "result": {"valid": valid}})
@@ -923,8 +997,6 @@ class OutOfProcessVaultGateClient:
         params: Optional[Dict[str, Any]] = None,
         *,
         rpc_nonce: Optional[str] = None,
-        simulate_peer_uid: Optional[int] = None,
-        simulate_peer_gid: Optional[int] = None,
     ) -> Dict[str, Any]:
         nonce = rpc_nonce if rpc_nonce is not None else ("nonce_" + secrets.token_hex(12))
         payload: Dict[str, Any] = {
@@ -932,11 +1004,6 @@ class OutOfProcessVaultGateClient:
             "rpc_nonce": nonce,
             "params": params or {},
         }
-        if simulate_peer_uid is not None:
-            payload["_simulate_peer_uid"] = simulate_peer_uid
-        if simulate_peer_gid is not None:
-            payload["_simulate_peer_gid"] = simulate_peer_gid
-
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(5.0)
             sock.connect(self._socket_path)
@@ -1184,11 +1251,33 @@ def _audit_sink_daemon_loop(
 ) -> None:
     die_with_parent()
     checkpoint_signing_key = secrets.token_bytes(32)
-    entries: List[Dict[str, Any]] = []
+    entry_count = 0
+    chain_head = "sha256:" + ("0" * 64)
     fsync_count = 0
+    write_failed = False
 
     os.makedirs(os.path.dirname(ledger_file_path), exist_ok=True)
-    log_fd = os.open(ledger_file_path, os.O_CREAT | os.O_WRONLY | os.O_APPEND | os.O_TRUNC, 0o600)
+    log_fd = os.open(ledger_file_path, os.O_CREAT | os.O_WRONLY | os.O_APPEND | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+
+    def _disk_entries():
+        fd = os.open(ledger_file_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info, original = os.fstat(fd), os.fstat(log_fd)
+            if (info.st_dev, info.st_ino) != (original.st_dev, original.st_ino):
+                raise ValueError("ERR_AUDIT_FILE_REPLACED")
+            with os.fdopen(fd, "rb", closefd=False) as handle:
+                while True:
+                    line = handle.readline(MAX_AUDIT_ENTRY_BYTES + 1)
+                    if not line:
+                        break
+                    if len(line) > MAX_AUDIT_ENTRY_BYTES or not line.endswith(b"\n"):
+                        raise ValueError("ERR_AUDIT_ENTRY_LENGTH")
+                    record = json.loads(line)
+                    if not isinstance(record, dict):
+                        raise ValueError("ERR_AUDIT_RECORD_SHAPE")
+                    yield record, len(line)
+        finally:
+            os.close(fd)
 
     if os.path.exists(socket_path):
         os.unlink(socket_path)
@@ -1211,10 +1300,10 @@ def _audit_sink_daemon_loop(
     try:
         while running:
             conn, _ = server.accept()
-            with conn:
+            with _isolated_ipc_connection(conn):
                 try:
                     peer_pid, peer_uid, peer_gid = _extract_so_peercred(conn)
-                    req = _recv_framed_json(conn)
+                    req = _recv_rpc_request(conn)
                 except Exception as exc:
                     _send_framed_json(conn, {"status": "error", "error_code": "ERR_IPC_READ", "reason": str(exc)})
                     continue
@@ -1240,7 +1329,11 @@ def _audit_sink_daemon_loop(
 
                 try:
                     if method == "append_entry":
+                        if write_failed:
+                            raise RuntimeError("ERR_AUDIT_WRITE_FAILED_CLOSED")
                         entry = params["entry"]
+                        if not isinstance(entry, dict):
+                            raise ValueError("ERR_AUDIT_RECORD_SHAPE")
                         # 1. Verify no raw pixel bytes or unredacted prompt payloads
                         assert_no_raw_buffer_leakage(entry)
                         serialized_entry = canonical_json(entry)
@@ -1252,12 +1345,8 @@ def _audit_sink_daemon_loop(
                             )
 
                         # 2. Verify sequential ordering & hash-chain link
-                        expected_seq = len(entries) + 1
-                        expected_prev = (
-                            entries[-1]["entry_hash"]
-                            if entries
-                            else "sha256:" + ("0" * 64)
-                        )
+                        expected_seq = entry_count + 1
+                        expected_prev = chain_head
                         if entry.get("entry_seq") != expected_seq:
                             raise ValueError(
                                 f"ERR_AUDIT_SEQUENCE_VIOLATION: Expected seq {expected_seq}, got {entry.get('entry_seq')}"
@@ -1278,10 +1367,22 @@ def _audit_sink_daemon_loop(
 
                         # 5. Durable O_APPEND + os.fsync write
                         line_bytes = (serialized_entry + "\n").encode("utf-8")
-                        os.write(log_fd, line_bytes)
-                        os.fsync(log_fd)
+                        if len(line_bytes) > MAX_AUDIT_ENTRY_BYTES:
+                            raise ValueError("ERR_AUDIT_ENTRY_TOO_LARGE")
+                        try:
+                            pending = memoryview(line_bytes)
+                            while pending:
+                                written = os.write(log_fd, pending)
+                                if written <= 0:
+                                    raise OSError("short audit write")
+                                pending = pending[written:]
+                            os.fsync(log_fd)
+                        except OSError:
+                            write_failed = True
+                            raise
                         fsync_count += 1
-                        entries.append(copy.deepcopy(entry))
+                        entry_count = expected_seq
+                        chain_head = entry["entry_hash"]
                         _send_framed_json(
                             conn,
                             {
@@ -1295,12 +1396,8 @@ def _audit_sink_daemon_loop(
                         )
 
                     elif method == "export_chain_head":
-                        head_seq = entries[-1]["entry_seq"] if entries else 0
-                        head_digest = (
-                            entries[-1]["entry_hash"]
-                            if entries
-                            else "sha256:" + ("0" * 64)
-                        )
+                        head_seq = entry_count
+                        head_digest = chain_head
                         _send_framed_json(
                             conn,
                             {
@@ -1309,7 +1406,9 @@ def _audit_sink_daemon_loop(
                                     "sink_type": "out_of_process_append_only_worm_audit_sink_v1",
                                     "daemon_pid": os.getpid(),
                                     "durable_ledger_path": ledger_file_path,
-                                    "entry_count": len(entries),
+                                    "entry_count": entry_count,
+                                    "retained_entry_records": 0,
+                                    "write_failed_closed": write_failed,
                                     "head_seq": head_seq,
                                     "chain_head_digest": head_digest,
                                     "fsync_count": fsync_count,
@@ -1326,72 +1425,51 @@ def _audit_sink_daemon_loop(
                         )
 
                     elif method == "verify_durable_file":
-                        # Re-read the on-disk JSONL file and verify every link from genesis
-                        if not os.path.exists(ledger_file_path):
-                            raise ValueError("ERR_AUDIT_FILE_MISSING")
-                        with open(ledger_file_path, "r", encoding="utf-8") as f:
-                            lines = [ln.strip() for ln in f if ln.strip()]
                         expected_prev = "sha256:" + ("0" * 64)
-                        for idx, ln in enumerate(lines, start=1):
-                            rec = json.loads(ln)
-                            if rec.get("entry_seq") != idx or rec.get("prev_hash") != expected_prev:
-                                _send_framed_json(
-                                    conn,
-                                    {
-                                        "status": "ok",
-                                        "result": {
-                                            "valid": False,
-                                            "error_code": "ERR_AUDIT_CHAIN_BROKEN",
-                                            "failed_seq": idx,
-                                        },
-                                    },
-                                )
-                                break
-                            for req_clock in ("logical_clock", "logical_timestamp", "utc_wall_timestamp"):
-                                if not rec.get(req_clock):
-                                    _send_framed_json(
-                                        conn,
-                                        {
-                                            "status": "ok",
-                                            "result": {
-                                                "valid": False,
-                                                "error_code": "ERR_AUDIT_CLOCK_MISSING",
-                                                "failed_seq": idx,
-                                            },
-                                        },
-                                    )
+                        count = 0
+                        error = None
+                        try:
+                            for idx, (rec, _) in enumerate(_disk_entries(), start=1):
+                                count = idx
+                                if rec.get("entry_seq") != idx or rec.get("prev_hash") != expected_prev:
+                                    error = "ERR_AUDIT_CHAIN_BROKEN"
+                                elif any(not rec.get(c) for c in ("logical_clock", "logical_timestamp", "utc_wall_timestamp")):
+                                    error = "ERR_AUDIT_CLOCK_MISSING"
+                                else:
+                                    body = {k: v for k, v in rec.items() if k != "entry_hash"}
+                                    if sha256_hex(canonical_json(body).encode("utf-8")) != rec.get("entry_hash"):
+                                        error = "ERR_AUDIT_HASH_MISMATCH"
+                                if error:
                                     break
-                            body = {k: v for k, v in rec.items() if k != "entry_hash"}
-                            recomputed = sha256_hex(canonical_json(body).encode("utf-8"))
-                            if recomputed != rec.get("entry_hash"):
-                                _send_framed_json(
-                                    conn,
-                                    {
-                                        "status": "ok",
-                                        "result": {
-                                            "valid": False,
-                                            "error_code": "ERR_AUDIT_HASH_MISMATCH",
-                                            "failed_seq": idx,
-                                        },
-                                    },
-                                )
-                                break
-                            expected_prev = rec["entry_hash"]
-                        else:
-                            _send_framed_json(
-                                conn,
-                                {
-                                    "status": "ok",
-                                    "result": {
-                                        "valid": True,
-                                        "verified_entries": len(lines),
-                                        "chain_head_digest": expected_prev,
-                                    },
-                                },
-                            )
+                                expected_prev = rec["entry_hash"]
+                        except (OSError, ValueError, TypeError) as exc:
+                            error = f"ERR_AUDIT_FILE_INVALID: {exc}"
+                        if not error and (count != entry_count or expected_prev != chain_head):
+                            error = "ERR_AUDIT_COMMITTED_HEAD_MISMATCH"
+                        _send_framed_json(conn, {"status": "ok", "result": {
+                            "valid": error is None, "verified_entries": count,
+                            "chain_head_digest": expected_prev,
+                            **({"error_code": error, "failed_seq": count} if error else {}),
+                        }})
 
                     elif method == "get_entries":
-                        _send_framed_json(conn, {"status": "ok", "result": {"entries": entries}})
+                        after = int(params.get("after_seq", 0))
+                        limit = int(params.get("limit", MAX_AUDIT_PAGE_ENTRIES))
+                        if after < 0 or not 1 <= limit <= MAX_AUDIT_PAGE_ENTRIES:
+                            raise ValueError("ERR_AUDIT_PAGE_BOUNDS")
+                        page, page_bytes = [], 0
+                        for rec, size in _disk_entries():
+                            if rec["entry_seq"] <= after:
+                                continue
+                            if len(page) >= limit or page_bytes + size > MAX_AUDIT_PAGE_BYTES:
+                                break
+                            page.append(rec)
+                            page_bytes += size
+                        next_seq = page[-1]["entry_seq"] if page else after
+                        _send_framed_json(conn, {"status": "ok", "result": {
+                            "entries": page, "next_after_seq": next_seq,
+                            "has_more": next_seq < entry_count, "entry_count": entry_count,
+                        }})
 
                     else:
                         raise ValueError(f"Unsupported AuditSink method: {method}")
@@ -1454,8 +1532,14 @@ class OutOfProcessAuditSinkClient:
     def verify_durable_file(self) -> Dict[str, Any]:
         return self._call("verify_durable_file")
 
+    def get_entries_page(self, *, after_seq: int = 0, limit: int = MAX_AUDIT_PAGE_ENTRIES) -> Dict[str, Any]:
+        return self._call("get_entries", {"after_seq": after_seq, "limit": limit})
+
     def get_entries(self) -> List[Dict[str, Any]]:
-        return self._call("get_entries")["entries"]
+        page = self.get_entries_page()
+        if page["has_more"]:
+            raise RuntimeError("ERR_AUDIT_PAGINATION_REQUIRED: use get_entries_page; no events omitted silently")
+        return page["entries"]
 
 
 class OutOfProcessAuditSinkDaemon:
@@ -1623,6 +1707,9 @@ def _quarantine_and_kill_switch_daemon_loop(
         telemetry_snapshot: Dict[str, Any],
     ) -> Dict[str, Any]:
         nonlocal halted, halt_reason
+        # Close admission before clocks, escalation, serialization or storage can fail.
+        halted = True
+        halt_reason = f"{ks_id} ({kill_switches_state[ks_id]['name']}): {reason}"
         utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         ks_entry = kill_switches_state[ks_id]
         ks_entry["triggered"] = True
@@ -1680,7 +1767,7 @@ def _quarantine_and_kill_switch_daemon_loop(
         bundle["evidence_sha256"] = sha256_hex(canonical_json(bundle).encode("utf-8"))
         preserved_forensic_bundles.append(bundle)
 
-        # Write durable forensic evidence file with os.fsync BEFORE setting halted
+        # Persist evidence after admission is irrevocably closed.
         os.makedirs(os.path.dirname(forensic_evidence_path), exist_ok=True)
         fd = os.open(
             forensic_evidence_path,
@@ -1693,18 +1780,16 @@ def _quarantine_and_kill_switch_daemon_loop(
         finally:
             os.close(fd)
 
-        halted = True
-        halt_reason = f"{ks_id} ({ks_entry['name']}): {reason}"
         return bundle
 
     running = True
     try:
         while running:
             conn, _ = server.accept()
-            with conn:
+            with _isolated_ipc_connection(conn):
                 try:
                     _peer_pid, peer_uid, peer_gid = _extract_so_peercred(conn)
-                    req = _recv_framed_json(conn)
+                    req = _recv_rpc_request(conn)
                 except Exception as exc:
                     _send_framed_json(conn, {"status": "error", "error_code": "ERR_IPC_READ", "reason": str(exc)})
                     continue
@@ -1777,10 +1862,19 @@ def _quarantine_and_kill_switch_daemon_loop(
                         origin = params.get("origin_attestation", "synthetic_fixture")
 
                         # 1. Enforce synthetic-only input policy; and, on the owner's word (2026-10-30), a picture the owner
-                        #    sent to remake or enhance, said honestly as such. And, on the owner's word (2026-11-04), the
-                        #    companion's own desktop glance (frames held in memory only, never saved). All other live
-                        #    capture stays refused.
-                        if origin not in ("synthetic_fixture", "owner_supplied_picture", "companion_desktop_glance"):
+                        #    sent to remake or enhance, said honestly as such; on the owner's word (2026-11-04), the
+                        #    companion's own desktop glance (frames held in memory only, never saved); and, on the owner's
+                        #    word (2026-11-16), Electric Browser's in-memory viewport frame ('electric_browser_frame');
+                        #    and, on the owner's word (2026-11-13/14), a PlayHub screen's frames: the player's own game
+                        #    window, measured in memory only ('play_engine_screen').
+                        #    All other live capture stays refused.
+                        if origin not in (
+                            "synthetic_fixture",
+                            "owner_supplied_picture",
+                            "companion_desktop_glance",
+                            "electric_browser_frame",
+                            "play_engine_screen",
+                        ):
                             quarantine_rejected_count += 1
                             raise PermissionError(
                                 f"ERR_NON_SYNTHETIC_INPUT_PROHIBITED: origin_attestation='{origin}' rejected by zero-PII quarantine."
@@ -2130,12 +2224,30 @@ def run_exec_gate_verification_suite(
         v_status_initial = vault_client.ping_status()
         vault_pid = v_status_initial["daemon_pid"]
 
-        # Test SO_PEERCRED rejection of unauthorized peer UID
+        # Negative credential testing uses a separate daemon's expected UID, never RPC data.
         peer_auth_rejected = False
+        negative_sock = os.path.join(run_dir, "n.sock")
+        negative_ready = multiprocessing.Event()
+        negative_proc = multiprocessing.Process(
+            target=_vault_gate_daemon_loop,
+            args=(negative_sock, os.getuid() + 9999, os.getgid(), negative_ready, None,
+                  vault_daemon.capture_service_auth_secret),
+            daemon=True,
+        )
+        negative_proc.start()
         try:
-            vault_client._call("ping_status", simulate_peer_uid=os.getuid() + 9999)
-        except PermissionError as exc:
-            peer_auth_rejected = "ERR_PEER_AUTH_FAILED" in str(exc)
+            if not negative_ready.wait(timeout=5.0):
+                raise RuntimeError("Negative peer test daemon failed to start")
+            negative_client = OutOfProcessVaultGateClient(negative_sock, vault_daemon.capture_service_auth_secret)
+            try:
+                negative_client.ping_status()
+            except PermissionError as exc:
+                peer_auth_rejected = "ERR_PEER_AUTH_FAILED" in str(exc)
+        finally:
+            negative_proc.terminate()
+            negative_proc.join(timeout=2.0)
+            if os.path.exists(negative_sock):
+                os.unlink(negative_sock)
 
         # Test prohibited RPC method on narrow IPC boundary
         prohibited_method_rejected = False
